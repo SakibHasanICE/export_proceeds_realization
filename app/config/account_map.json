@@ -1,0 +1,8 @@
+{
+  "_comment": "HSBC: key = last 6 digits of the masked account. SCB: key = full account number. account_head = exact ERP head text.",
+  "501091": {"ac_no": "007032501091", "account_head": null},
+  "501047": {"ac_no": null, "account_head": null},
+  "501092": {"ac_no": null, "account_head": null},
+  "01130769902": {"ac_no": "01130769902", "account_head": null},
+  "46130769901": {"ac_no": "46130769901", "account_head": null}
+}

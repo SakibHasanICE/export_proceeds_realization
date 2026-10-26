@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+staging/
+logs/
+local.db
+.venv/
+*.egg-info/
+.env/
+venv/
+venv
+tests/
+tests
+

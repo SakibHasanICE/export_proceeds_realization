@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5434}:5432"   # this machine only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5051}:80"
+    depends_on:
+      - db
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db          # overrides POSTGRES_HOST=localhost from .env inside Docker
+      POSTGRES_PORT: "5432"
+      BIND_HOST: 0.0.0.0
+      API_PORT: "8000"           # container-side ports; host ports come from .env
+      UI_PORT: "8501"
+      API_URL: http://localhost:8000
+      STAGING_DIR: /data/staging
+      LOG_DIR: /data/logs
+    volumes:
+      - appdata:/data
+    ports:
+      - "127.0.0.1:${API_PORT:-8001}:8000"
+      - "127.0.0.1:${UI_PORT:-8502}:8501"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  appdata:
