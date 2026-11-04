@@ -1,8 +1,54 @@
 {
-  "_comment": "HSBC: key = last 6 digits of the masked account. SCB: key = full account number. account_head = exact ERP head text.",
-  "501091": {"ac_no": "007032501091", "account_head": null},
-  "501047": {"ac_no": null, "account_head": null},
-  "501092": {"ac_no": null, "account_head": null},
-  "01130769902": {"ac_no": "01130769902", "account_head": null},
-  "46130769901": {"ac_no": "46130769901", "account_head": null}
+  "_comment": "HSBC: key = last 6 digits of the masked account; the full number is 007032 + those 6 digits. SCB/BRAC: key = full account number. account_head = exact ERP head text. DEDUCTION = default head for Deductions at Source rows. EBL: key = full account number from the sheet (MARGIN CORP. 220600009, UGL ERQ 1043100450368, margin on other import obligations 220600017, UGL CD 1111060214910).",
+  "DEDUCTION": {
+    "account_head": null
+  },
+  "501091": {
+    "ac_no": "007032501091",
+    "account_head": null
+  },
+  "501047": {
+    "ac_no": "007032501047",
+    "account_head": null
+  },
+  "501092": {
+    "ac_no": "007032501092",
+    "account_head": null
+  },
+  "01130769902": {
+    "ac_no": "01130769902",
+    "account_head": null
+  },
+  "46130769901": {
+    "ac_no": "46130769901",
+    "account_head": null
+  },
+  "1501202697146005": {
+    "ac_no": "1501202697146005",
+    "account_head": null
+  },
+  "1501202697146002": {
+    "ac_no": "1501202697146002",
+    "account_head": null
+  },
+  "2026971460009": {
+    "ac_no": "2026971460009",
+    "account_head": null
+  },
+  "220600009": {
+    "ac_no": "220600009",
+    "account_head": null
+  },
+  "1043100450368": {
+    "ac_no": "1043100450368",
+    "account_head": null
+  },
+  "220600017": {
+    "ac_no": "220600017",
+    "account_head": null
+  },
+  "1111060214910": {
+    "ac_no": "1111060214910",
+    "account_head": null
+  }
 }

@@ -39,8 +39,10 @@ services:
       API_URL: http://localhost:8000
       STAGING_DIR: /data/staging
       LOG_DIR: /data/logs
+      LEDGER_XLSX: /data/exports/export_proceeds_log.xlsx   # the Excel register (see ./exports on this machine)
     volumes:
       - appdata:/data
+      - ./exports:/data/exports      # the register file appears in the "exports" folder next to this file
     ports:
       - "127.0.0.1:${API_PORT:-8001}:8000"
       - "127.0.0.1:${UI_PORT:-8502}:8501"

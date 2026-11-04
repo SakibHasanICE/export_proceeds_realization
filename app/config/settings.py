@@ -1,6 +1,7 @@
 """Central configuration. Secrets come from the environment / .env (never commit .env)."""
 import json
 import os
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -16,6 +17,15 @@ def _csv(name: str, default: str = "") -> list[str]:
 
 def _bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _decimals(name: str, default: str) -> list[Decimal]:
+    return [Decimal(x) for x in _csv(name, default)]
+
+
+def _band(name: str, default: str) -> tuple[Decimal, Decimal]:
+    lo, hi = (Decimal(x.strip()) for x in os.getenv(name, default).split(","))
+    return lo, hi
 
 
 def _load_account_map() -> dict:
@@ -65,9 +75,23 @@ class Settings:
     openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
     openrouter_model = os.getenv("OPENROUTER_MODEL", "mistralai/ministral-8b-2512")
 
-    # --- business rules
-    bill_amount_basis = os.getenv("BILL_AMOUNT_BASIS", "proceeds")  # "proceeds" | "stated"
     account_map = _load_account_map()
+
+    # --- conversion-rate derivation (see bank_parsers.solve_rate)
+    # Candidate source-tax percentages, tried in order (1% first). Some bills are taxed at a lower
+    # effective rate (e.g. 0.83%), so the rate is solved against every candidate. Add new ones here
+    # (decimal fractions: 0.01 = 1%) without touching code.
+    source_tax_rates = _decimals("SOURCE_TAX_RATES", "0.01,0.0083")
+    # Plausible BDT-per-unit range per currency. A derived rate outside it is rejected, not filled in.
+    fx_sanity = {"USD": _band("FX_SANITY_USD", "115,130")}
+
+    # HSBC prints masked accounts (******501047); the full number is this fixed prefix + the last 6 digits.
+    hsbc_account_prefix = os.getenv("HSBC_ACCOUNT_PREFIX", "007032").strip()
+
+    # --- local Excel register (see components/ledger.py). Empty = disabled.
+    ledger_path = Path(os.getenv("LEDGER_XLSX")) if os.getenv("LEDGER_XLSX", "").strip() else None
+    # Bangladesh has no DST: the register's "Date" is the mail's arrival date in this UTC offset (hours).
+    local_utc_offset_hours = float(os.getenv("LOCAL_UTC_OFFSET_HOURS", "6"))
 
     # --- servers
     bind_host = os.getenv("BIND_HOST", "127.0.0.1")

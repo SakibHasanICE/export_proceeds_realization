@@ -43,6 +43,12 @@ class DistributionIn(BaseModel):
     document_currency: float
 
 
+class DeductionIn(BaseModel):
+    label: Optional[str] = None
+    account_head: Optional[str] = None
+    document_currency: float
+
+
 class RealizationUpdate(BaseModel):
     beneficiary: Optional[str] = None
     buyer: Optional[str] = None
@@ -52,6 +58,7 @@ class RealizationUpdate(BaseModel):
     bill_invoice_amount: Optional[float] = None
     conversion_rate: Optional[float] = None
     distributions: Optional[list[DistributionIn]] = None
+    deductions: Optional[list[DeductionIn]] = None
 
 
 @app.get("/health")
@@ -70,14 +77,15 @@ def poll_now():
 
 @router.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Manually process a PDF (testing / mails that were not picked up)."""
+    """Manually process a bank advice PDF or an EBL realization sheet (.xlsx)."""
     data = await file.read()
     if len(data) > MAX_UPLOAD:
         raise HTTPException(413, "file too large (10 MB max)")
-    if data[:4] != b"%PDF":
-        raise HTTPException(400, "not a PDF file")
+    is_pdf = data[:4] == b"%PDF"
+    if not is_pdf and data[:4] != b"PK\x03\x04":      # .xlsx is a zip; the parser verifies it properly
+        raise HTTPException(400, "not a PDF or Excel (.xlsx) file")
     settings.staging_dir.mkdir(parents=True, exist_ok=True)
-    path = settings.staging_dir / f"upload_{uuid.uuid4().hex[:8]}.pdf"
+    path = settings.staging_dir / f"upload_{uuid.uuid4().hex[:8]}{'.pdf' if is_pdf else '.xlsx'}"
     path.write_bytes(data)
     try:
         return pipeline.process_file(path, message_id=None)
@@ -103,8 +111,9 @@ def get_realization(rid: int):
 def update_realization(rid: int, body: RealizationUpdate):
     fields = body.model_dump(exclude_unset=True)
     dists = fields.pop("distributions", None)
+    deds = fields.pop("deductions", None)
     try:
-        rec = database.update_realization(rid, fields, dists)
+        rec = database.update_realization(rid, fields, dists, deds)
     except ValueError as e:
         raise HTTPException(409, str(e))
     if rec is None:
@@ -119,6 +128,22 @@ def approve(rid: int):
         rec = database.approve_realization(rid)
     except ValueError as e:
         raise HTTPException(422, f"cannot approve, missing/inconsistent: {e}")
+    if rec is None:
+        raise HTTPException(404, "not found")
+    return rec
+
+
+class FilledIn(BaseModel):
+    note: Optional[str] = None      # e.g. the ERP's own entry number, for the audit trail
+
+
+@router.post("/realizations/{rid}/filled")
+def filled(rid: int, body: Optional[FilledIn] = None):
+    """RPA callback: the robot entered this approved entry into the ERP (status approved -> filled)."""
+    try:
+        rec = database.mark_filled(rid, body.note if body else None)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
     if rec is None:
         raise HTTPException(404, "not found")
     return rec

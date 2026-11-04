@@ -2,7 +2,9 @@
 import email
 import hashlib
 import imaplib
+import io
 import re
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from email import policy
@@ -48,6 +50,28 @@ def extract_pdf_attachments(msg) -> list[tuple[str, bytes]]:
             continue
         data = part.get_payload(decode=True)
         if data and data[:4] == b"%PDF":
+            out.append((part.get_filename(), data))
+    return out
+
+
+def _is_xlsx(data: bytes) -> bool:
+    if data[:4] != b"PK\x03\x04":
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return "xl/workbook.xml" in z.namelist()
+    except zipfile.BadZipFile:
+        return False
+
+
+def extract_attachments(msg) -> list[tuple[str, bytes]]:
+    """PDFs plus Excel workbooks (EBL realization sheets), judged by content, not by file name."""
+    out = list(extract_pdf_attachments(msg))
+    for part in msg.walk():
+        if part.is_multipart() or not part.get_filename():
+            continue
+        data = part.get_payload(decode=True)
+        if data and _is_xlsx(data):
             out.append((part.get_filename(), data))
     return out
 
@@ -126,7 +150,7 @@ class EmailAgent:
                 date = parsedate_to_datetime(str(msg.get("Date"))) if msg.get("Date") else None
             except (TypeError, ValueError):
                 date = None
-            paths = save_attachments(mid, extract_pdf_attachments(msg), settings.staging_dir)
+            paths = save_attachments(mid, extract_attachments(msg), settings.staging_dir)
             yield IncomingMail(uid, mid, sender, str(msg.get("Subject", "")), date, paths)
 
     def mark_seen(self, uid: str) -> None:

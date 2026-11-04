@@ -64,6 +64,9 @@ class Realization(Base):
     distributions: Mapped[list["Distribution"]] = relationship(
         back_populates="realization", cascade="all, delete-orphan",
         order_by="Distribution.id", lazy="selectin")
+    deductions: Mapped[list["Deduction"]] = relationship(
+        back_populates="realization", cascade="all, delete-orphan",
+        order_by="Deduction.id", lazy="selectin")
 
 
 class Distribution(Base):
@@ -77,6 +80,20 @@ class Distribution(Base):
     conversion_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
     domestic_currency: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     realization: Mapped[Realization] = relationship(back_populates="distributions")
+
+
+class Deduction(Base):
+    """'Deductions at Source': foreign-currency charges taken out of the bill amount."""
+    __tablename__ = "realization_deductions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    realization_id: Mapped[int] = mapped_column(ForeignKey("export_realizations.id", ondelete="CASCADE"))
+    label: Mapped[str | None] = mapped_column(String(200))        # what the bank called it (info only)
+    account_head: Mapped[str | None] = mapped_column(String(300))
+    document_currency: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    conversion_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
+    domestic_currency: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    realization: Mapped[Realization] = relationship(back_populates="deductions")
 
 
 class ProcessedEmail(Base):
@@ -131,13 +148,21 @@ def _dist_dict(d: Distribution) -> dict:
             "domestic_currency": _f(d.domestic_currency)}
 
 
+def _ded_dict(d: Deduction) -> dict:
+    return {"id": d.id, "label": d.label, "account_head": d.account_head,
+            "document_currency": _f(d.document_currency), "conversion_rate": _f(d.conversion_rate),
+            "domestic_currency": _f(d.domestic_currency)}
+
+
 def _to_dict(r: Realization) -> dict:
-    doc_total = sum((Decimal(str(d.document_currency)) for d in r.distributions), Decimal("0"))
+    dec = lambda rows: sum((Decimal(str(x.document_currency)) for x in rows), Decimal("0"))
+    doc_total = dec(r.deductions) + dec(r.distributions)
     balance = (Decimal(str(r.bill_invoice_amount)) - doc_total) if r.bill_invoice_amount is not None else None
     return {
-        "grand_total_document": _f(doc_total),
-        "cumulative_bill_balance": _f(balance),     # bill amount - distributions; must be 0 to approve
+        "grand_total_document": _f(doc_total),       # deductions + distributions
+        "cumulative_bill_balance": _f(balance),      # bill amount - grand total; must be 0 to approve
         "grand_total_domestic": _f(r.total_domestic),
+        "deductions": [_ded_dict(d) for d in r.deductions],
         "id": r.id, "bank": r.bank, "bill_invoice_no": r.bill_invoice_no,
         "beneficiary": r.beneficiary, "buyer": r.buyer, "lc_sc_no": r.lc_sc_no,
         "received_date": r.received_date.isoformat() if r.received_date else None,
@@ -179,9 +204,17 @@ def save_realization(rec: dict, message_id: str | None = None) -> tuple[str, int
                 bill_invoice_date=date.fromisoformat(rec["bill_invoice_date"]),
                 currency=rec["currency"], bill_invoice_amount=_q2(rec["bill_invoice_amount"]),
                 conversion_rate=Decimal(str(rec["conversion_rate"])) if rec["conversion_rate"] is not None else None,
-                total_domestic=_q2(rec["total_domestic"]), needs_review=rec["needs_review"],
+                buyer=rec.get("buyer"), lc_sc_no=rec.get("lc_sc_no"),
+                total_domestic=_q2(rec["total_domestic"]) if rec["total_domestic"] is not None else None,
+                needs_review=rec["needs_review"],
                 issues=rec["issues"], notes=rec["notes"], meta=rec["meta"],
                 source_file=rec.get("source_file"), message_id=message_id,
+                deductions=[Deduction(
+                    label=d.get("label"), account_head=d.get("account_head"),
+                    document_currency=_q2(d["document_currency"]),
+                    conversion_rate=Decimal(str(d["conversion_rate"])) if d["conversion_rate"] is not None else None,
+                    domestic_currency=_q2(d["domestic_currency"]) if d["domestic_currency"] is not None else None,
+                ) for d in rec.get("deductions", [])],
                 distributions=[Distribution(
                     account_head=d["account_head"], ac_loan_no=d["ac_loan_no"],
                     document_currency=_q2(d["document_currency"]),
@@ -225,6 +258,12 @@ def list_realizations(status: str | None = None, needs_review: bool | None = Non
         return [_to_dict(r) for r in s.scalars(q)]
 
 
+def all_realizations() -> list[dict]:
+    """Every entry, oldest first, with deductions and distributions (feeds the Excel register)."""
+    with get_session() as s:
+        return [_to_dict(r) for r in s.scalars(select(Realization).order_by(Realization.id))]
+
+
 def get_realization(rid: int) -> dict | None:
     with get_session() as s:
         r = s.get(Realization, rid)
@@ -240,7 +279,8 @@ def list_other_documents(limit: int = 200) -> list[dict]:
 
 
 # ---------------------------------------------------------------- edit / approve
-def update_realization(rid: int, fields: dict, distributions: list[dict] | None = None) -> dict | None:
+def update_realization(rid: int, fields: dict, distributions: list[dict] | None = None,
+                       deductions: list[dict] | None = None) -> dict | None:
     """Apply user edits, then recompute domestic = document x rate for every row."""
     with get_session() as s:
         r = s.get(Realization, rid)
@@ -263,8 +303,15 @@ def update_realization(rid: int, fields: dict, distributions: list[dict] | None 
                 r.distributions.append(Distribution(
                     account_head=d.get("account_head"), ac_loan_no=d.get("ac_loan_no"),
                     document_currency=_q2(d["document_currency"])))
+        if deductions is not None:
+            r.deductions.clear()
+            s.flush()
+            for d in deductions:
+                r.deductions.append(Deduction(
+                    label=d.get("label"), account_head=d.get("account_head"),
+                    document_currency=_q2(d["document_currency"])))
         total = Decimal("0")
-        for d in r.distributions:
+        for d in list(r.deductions) + list(r.distributions):
             if r.conversion_rate is not None:
                 d.conversion_rate = r.conversion_rate
                 d.domestic_currency = _q2(Decimal(str(d.document_currency)) * Decimal(str(r.conversion_rate)))
@@ -287,6 +334,10 @@ def missing_for_erp(d: dict) -> list[str]:
         for f in ("account_head", "ac_loan_no", "domestic_currency"):
             if not row.get(f):
                 missing.append(f"distribution {i}: {f}")
+    for i, row in enumerate(d.get("deductions", []), 1):
+        for f in ("account_head", "domestic_currency"):
+            if not row.get(f):
+                missing.append(f"deduction {i}: {f}")
     bal = d.get("cumulative_bill_balance")
     if d["distributions"] and bal is not None and abs(bal) > 0.005:
         missing.append(f"cumulative bill balance is {bal:.2f} (must be 0)")
@@ -307,6 +358,24 @@ def approve_realization(rid: int) -> dict | None:
         return _to_dict(r)
 
 
+def mark_filled(rid: int, note: str | None = None) -> dict | None:
+    """The RPA robot reports it has typed an approved entry into the ERP. Only approved entries qualify.
+    Calling it again on an entry that is already filled changes nothing, so the robot can retry safely."""
+    with get_session() as s:
+        r = s.get(Realization, rid)
+        if r is None:
+            return None
+        if r.status == "filled":
+            return _to_dict(r)
+        if r.status != "approved":
+            raise ValueError(f"entry is {r.status}; only approved entries can be marked filled")
+        r.status = "filled"
+        r.meta = {**(r.meta or {}), "erp_fill": {"at": _now().isoformat(), "note": note}}
+        r.updated_at = _now()
+        s.commit()
+        return _to_dict(r)
+
+
 def erp_payload(d: dict) -> dict:
     """Shaped like the ERP 'Export Proceeds Realization Entry' form (dd-mm-yyyy dates)."""
     fmt = lambda iso: date.fromisoformat(iso).strftime("%d-%m-%Y") if iso else None
@@ -314,8 +383,14 @@ def erp_payload(d: dict) -> dict:
         "Beneficiary": d["beneficiary"], "Buyer": d["buyer"], "Bill/Invoice No": d["bill_invoice_no"],
         "Received Date": fmt(d["received_date"]), "LC/SC No": d["lc_sc_no"], "Currency": d["currency"],
         "Bill/Invoice Date": fmt(d["bill_invoice_date"]), "Bill/Invoice Amount": d["bill_invoice_amount"],
+        "Deductions at Source": [{"Account Head": x["account_head"], "Document Currency": x["document_currency"],
+                                  "Conversion Rate": x["conversion_rate"],
+                                  "Domestic Currency": x["domestic_currency"]} for x in d["deductions"]],
         "Distributions": [{"Account Head": x["account_head"], "AC / Loan No": x["ac_loan_no"],
                            "Document Currency": x["document_currency"],
                            "Conversion Rate": x["conversion_rate"],
                            "Domestic Currency": x["domestic_currency"]} for x in d["distributions"]],
+        "Grand Total": {"Document Currency": d["grand_total_document"],
+                        "Cumulative Bill Balance": d["cumulative_bill_balance"],
+                        "Domestic Currency": d["grand_total_domestic"]},
     }

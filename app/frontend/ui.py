@@ -15,6 +15,18 @@ def dec(x) -> Decimal:
     return Decimal(str(x))
 
 
+def to_df(rows: list, cols: list) -> pd.DataFrame:
+    return pd.DataFrame(rows)[cols] if rows else pd.DataFrame(columns=cols)
+
+
+def totals(df: pd.DataFrame, rate):
+    """(document total, domestic total) of a table; domestic = document x rate, rounded per row."""
+    docs = [dec(v) for v in df["document_currency"].dropna()]
+    doc = sum(docs, Decimal("0"))
+    dom = sum(((d * dec(rate)).quantize(Decimal("0.01"), ROUND_HALF_UP) for d in docs), Decimal("0")) if rate else None
+    return doc, dom
+
+
 def clean(v):
     """Data-editor cells come back as NaN/'' when empty."""
     return None if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "" else str(v).strip()
@@ -95,29 +107,40 @@ with tab_entries:
         rate = st.number_input("Conversion rate (domestic / document)", value=float(rec["conversion_rate"] or 0),
                                format="%.4f", step=0.01, key=f"rt{sel}", disabled=not editable)
 
+        ro = {"disabled": not editable}
+        calc = st.column_config.NumberColumn(disabled=True, help="calculated = document x rate when you save")
+
+        st.subheader("Deductions at source")
+        ded_edit = st.data_editor(
+            to_df(rec["deductions"], ["label", "account_head", "document_currency", "conversion_rate", "domestic_currency"]),
+            num_rows="dynamic", use_container_width=True, key=f"ded{sel}",
+            column_config={"conversion_rate": calc, "domestic_currency": calc}, **ro)
+        ded_doc, ded_dom = totals(ded_edit, rate)
+        st.caption(f"Total: document {ded_doc:,.4f}  |  domestic {ded_dom:,.2f}" if ded_dom is not None
+                   else f"Total: document {ded_doc:,.4f}")
+
         st.subheader("Distributions")
-        edited = st.data_editor(
-            pd.DataFrame(rec["distributions"])[["account_head", "ac_loan_no", "document_currency", "domestic_currency"]]
-            if rec["distributions"] else pd.DataFrame(columns=["account_head", "ac_loan_no", "document_currency", "domestic_currency"]),
-            num_rows="dynamic", use_container_width=True, key=f"dist{sel}", disabled=not editable,
-            column_config={"domestic_currency": st.column_config.NumberColumn(disabled=True,
-                           help="calculated = document x rate when you save")})
+        dist_edit = st.data_editor(
+            to_df(rec["distributions"], ["account_head", "ac_loan_no", "document_currency", "conversion_rate", "domestic_currency"]),
+            num_rows="dynamic", use_container_width=True, key=f"dist{sel}",
+            column_config={"conversion_rate": calc, "domestic_currency": calc}, **ro)
+        dist_doc, dist_dom = totals(dist_edit, rate)
+        st.caption(f"Total: document {dist_doc:,.4f}  |  domestic {dist_dom:,.2f}" if dist_dom is not None
+                   else f"Total: document {dist_doc:,.4f}")
 
         # ---- Grand total (live preview from the values currently on screen) -------------------
-        docs = [dec(v) for v in edited["document_currency"].dropna()]
-        doc_total = sum(docs, Decimal("0"))
-        balance = dec(amount) - doc_total
-        dom_total = (sum(((d * dec(rate)).quantize(Decimal("0.01"), ROUND_HALF_UP) for d in docs), Decimal("0"))
-                     if rate else None)
+        grand_doc = ded_doc + dist_doc
+        grand_dom = (ded_dom + dist_dom) if rate else None
+        balance = dec(amount) - grand_doc
         g1, g2, g3 = st.columns(3)
-        g1.metric("Grand total: document currency", f"{doc_total:,.4f}")
+        g1.metric("Grand total: document currency", f"{grand_doc:,.4f}")
         g2.metric("Cumulative bill balance", f"{balance:,.5f}")
-        g3.metric("Grand total: domestic currency", f"{dom_total:,.4f}" if dom_total is not None else "-")
+        g3.metric("Grand total: domestic currency", f"{grand_dom:,.4f}" if grand_dom is not None else "-")
         if balance == 0:
-            st.success("Balance is 0: bill amount equals the distributions.")
+            st.success("Balance is 0: bill amount equals deductions + distributions.")
         else:
-            st.error(f"Balance is {balance:,.5f}. It must be 0: bill amount ({dec(amount):,.2f}) "
-                     f"minus distributions ({doc_total:,.2f}).")
+            st.error(f"Balance is {balance:,.5f}. It must be 0: bill amount ({dec(amount):,.2f}) minus "
+                     f"deductions ({ded_doc:,.2f}) and distributions ({dist_doc:,.2f}).")
         st.caption("These totals update as you edit. Click Save to store them, then Approve.")
 
         if rec["missing_for_erp"]:
@@ -128,11 +151,13 @@ with tab_entries:
             body = {"beneficiary": beneficiary, "buyer": buyer or None, "lc_sc_no": lc_sc or None,
                     "received_date": received.isoformat(), "bill_invoice_date": bill_date.isoformat(),
                     "bill_invoice_amount": amount, "conversion_rate": rate or None,
+                    "deductions": [{"label": clean(r.get("label")), "account_head": clean(r.get("account_head")),
+                                    "document_currency": float(r["document_currency"])}
+                                   for r in ded_edit.to_dict("records") if pd.notna(r.get("document_currency"))],
                     "distributions": [{"account_head": clean(r.get("account_head")),
                                        "ac_loan_no": clean(r.get("ac_loan_no")),
                                        "document_currency": float(r["document_currency"])}
-                                      for r in edited.to_dict("records")
-                                      if pd.notna(r.get("document_currency"))]}
+                                      for r in dist_edit.to_dict("records") if pd.notna(r.get("document_currency"))]}
             try:
                 api("PUT", f"/realizations/{sel}", json=body)
                 st.success("Saved")
@@ -151,10 +176,12 @@ with tab_entries:
             st.json(api("GET", f"/realizations/{sel}/erp"))
 
 with tab_upload:
-    up = st.file_uploader("Bank advice PDF", type=["pdf"])
-    if up and st.button("Process PDF"):
+    up = st.file_uploader("Bank advice PDF or EBL realization sheet (.xlsx)", type=["pdf", "xlsx"])
+    if up and st.button("Process file"):
         try:
-            st.json(api("POST", "/upload", files={"file": (up.name, up.getvalue(), "application/pdf")}))
+            mime = "application/pdf" if up.name.lower().endswith(".pdf") else \
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            st.json(api("POST", "/upload", files={"file": (up.name, up.getvalue(), mime)}))
         except Exception as e:
             st.error(str(e))
 

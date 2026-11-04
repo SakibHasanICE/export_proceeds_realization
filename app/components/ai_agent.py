@@ -25,8 +25,11 @@ LLM_SCHEMA = {
 
 
 def _pdf_text(data: bytes) -> str:
+    # x_tolerance matters: some bank PDFs (BRAC) contain no real space characters, only positioned
+    # glyphs. pdfplumber's default 3pt tolerance then glues words together ("ExportBillRealizationAdvice")
+    # and nothing downstream can match. 1.5pt recovers the gaps and leaves HSBC/SCB output unchanged.
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        return "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
+        return "\n".join((p.extract_text(layout=True, x_tolerance=1.5) or "") for p in pdf.pages)
 
 
 def read_pdf_text(path: str) -> str:
