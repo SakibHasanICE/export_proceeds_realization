@@ -190,14 +190,18 @@ def log_email(message_id: str, sender: str, subject: str, status: str) -> None:
 
 
 # ---------------------------------------------------------------- save
-def save_realization(rec: dict, message_id: str | None = None) -> tuple[str, int]:
+def save_realization(rec: dict, message_id: str | None = None, replace: bool = False) -> tuple[str, int]:
     """Returns ('saved'|'duplicate', id). One transaction: all rows commit together or not at all."""
     try:
         with get_session() as s:
             existing = s.scalar(select(Realization).where(
                 Realization.bank == rec["bank"], Realization.bill_invoice_no == rec["bill_invoice_no"]))
             if existing:
-                return "duplicate", existing.id
+                if replace and existing.status != "filled":      # re-read of an entry nobody has filled yet
+                    s.delete(existing)
+                    s.flush()
+                else:
+                    return "duplicate", existing.id
             r = Realization(
                 bank=rec["bank"], bill_invoice_no=rec["bill_invoice_no"], beneficiary=rec["beneficiary"],
                 received_date=date.fromisoformat(rec["received_date"]),

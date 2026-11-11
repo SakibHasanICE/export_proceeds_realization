@@ -23,7 +23,8 @@ def arrival_date(mail_date: datetime | None) -> date:
     return (mail_date.astimezone(tz) if mail_date.tzinfo else mail_date).date()
 
 
-def process_workbook(path: Path, message_id: str | None = None, mail_date: datetime | None = None) -> dict:
+def process_workbook(path: Path, message_id: str | None = None, mail_date: datetime | None = None,
+                     replace: bool = False) -> dict:
     """An EBL realization sheet holds many bills: store each one, report them individually."""
     try:
         recs = parse_workbook(path)
@@ -38,7 +39,7 @@ def process_workbook(path: Path, message_id: str | None = None, mail_date: datet
     arrived = arrival_date(mail_date).isoformat()
     for rec in recs:
         rec["meta"]["arrived_on"] = arrived
-        status, rid = database.save_realization(rec, message_id)
+        status, rid = database.save_realization(rec, message_id, replace)
         log.info("%s [%s] -> %s (id %s, review=%s)", path.name, rec["bill_invoice_no"], status, rid, rec["needs_review"])
         results.append({"file": path.name, "bill": rec["bill_invoice_no"], "status": status, "id": rid,
                         "needs_review": rec["needs_review"], "issues": rec["issues"]})
@@ -49,16 +50,17 @@ def process_workbook(path: Path, message_id: str | None = None, mail_date: datet
             "needs_review": any(r["needs_review"] for r in results), "results": results}
 
 
-def process_file(path: Path | str, message_id: str | None = None, mail_date: datetime | None = None) -> dict:
+def process_file(path: Path | str, message_id: str | None = None, mail_date: datetime | None = None,
+                 replace: bool = False) -> dict:
     """Extract one staged PDF (or EBL .xlsx) and store the result. mail_date = when the bank mail arrived."""
     path = Path(path)
     if is_workbook(path):
-        return process_workbook(path, message_id, mail_date)
+        return process_workbook(path, message_id, mail_date, replace)
     rec = extract_document(str(path))
     if rec.get("extractor") == "rules" and rec.get("doc_type") == "export_payment_advice" \
             and not rec.get("unsupported"):
         rec.setdefault("meta", {})["arrived_on"] = arrival_date(mail_date).isoformat()
-        status, rid = database.save_realization(rec, message_id)
+        status, rid = database.save_realization(rec, message_id, replace)
         ledger.sync()
         log.info("%s -> %s (id %s, review=%s)", path.name, status, rid, rec["needs_review"])
         return {"file": path.name, "status": status, "id": rid, "needs_review": rec["needs_review"],

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.common.custom_exception import CustomException
 from app.common.logger import get_logger
+from app.backend.erp_api import build_router as build_erp_router
 from app.components import database, pipeline
 from app.config.settings import settings
 
@@ -76,7 +77,7 @@ def poll_now():
 
 
 @router.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), replace: bool = False):
     """Manually process a bank advice PDF or an EBL realization sheet (.xlsx)."""
     data = await file.read()
     if len(data) > MAX_UPLOAD:
@@ -88,7 +89,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     path = settings.staging_dir / f"upload_{uuid.uuid4().hex[:8]}{'.pdf' if is_pdf else '.xlsx'}"
     path.write_bytes(data)
     try:
-        return pipeline.process_file(path, message_id=None)
+        return pipeline.process_file(path, message_id=None, replace=replace)
     except CustomException as e:
         raise HTTPException(500, str(e))
 
@@ -164,3 +165,4 @@ def other_documents():
 
 
 app.include_router(router)
+app.include_router(build_erp_router(require_key))

@@ -8,7 +8,6 @@ python-dotenv
 requests
 pdfplumber
 pypdf
-streamlit
-pandas
 pytest
 openpyxl
+playwright

@@ -11,4 +11,6 @@ venv/
 venv
 tests/
 tests
+exports/
+exports
 

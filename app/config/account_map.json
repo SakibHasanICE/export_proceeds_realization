@@ -1,51 +1,51 @@
 {
-  "_comment": "HSBC: key = last 6 digits of the masked account; the full number is 007032 + those 6 digits. SCB/BRAC: key = full account number. account_head = exact ERP head text. DEDUCTION = default head for Deductions at Source rows. EBL: key = full account number from the sheet (MARGIN CORP. 220600009, UGL ERQ 1043100450368, margin on other import obligations 220600017, UGL CD 1111060214910).",
+  "_comment": "HSBC: key = last 6 digits of the masked account; the full number is 007032 + those 6 digits. SCB/BRAC: key = full account number. account_head = exact ERP head text. DEDUCTION = default head for Deductions at Source rows. EBL: key = full account number from the sheet (MARGIN CORP. 220600009, UGL ERQ 1043100450368, margin on other import obligations 220600017, UGL CD 1111060214910). DEDUCTION:<label in lower case> = head for one kind of deduction row (e.g. DEDUCTION:other bank charges); it wins over DEDUCTION. SCB: every USD credit is merged into 01130769902 (BTB head). EBL: margin + margin on other import obligations merge on 220600009 (BTB head), ERQ 1043100450368 -> ERQ Account. All deductions use DEDUCTION = Foreign Collection Charge.",
   "DEDUCTION": {
-    "account_head": null
+    "account_head": "Foreign Collection Charge"
   },
   "501091": {
     "ac_no": "007032501091",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "501047": {
     "ac_no": "007032501047",
-    "account_head": null
+    "account_head": "ERQ Account"
   },
   "501092": {
     "ac_no": "007032501092",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "01130769902": {
     "ac_no": "01130769902",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "46130769901": {
     "ac_no": "46130769901",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "1501202697146005": {
     "ac_no": "1501202697146005",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "1501202697146002": {
     "ac_no": "1501202697146002",
-    "account_head": null
+    "account_head": "ERQ Account"
   },
   "2026971460009": {
     "ac_no": "2026971460009",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "220600009": {
     "ac_no": "220600009",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "1043100450368": {
     "ac_no": "1043100450368",
-    "account_head": null
+    "account_head": "ERQ Account"
   },
   "220600017": {
     "ac_no": "220600017",
-    "account_head": null
+    "account_head": "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C"
   },
   "1111060214910": {
     "ac_no": "1111060214910",

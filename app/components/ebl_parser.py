@@ -7,8 +7,8 @@ by letter, so inserting a column does not break it.
 Mapping used for the ERP form (change DISTRIBUTIONS below if your ERP entry differs):
   Bill/Invoice Amount   = BILL AMT. (USD)
   Deductions at source  = SHORT AMT. (bill amount - proceeds), USD
-  Distributions         = MARGIN, CM AMT., ERQ, MARGIN ON OTHER IMPORT OBLIGATIONS, each to the account
-                          printed in the same row; zero amounts are skipped
+  Distributions         = MARGIN + MARGIN ON OTHER IMPORT OBLIGATIONS merged on the margin account, ERQ on the
+                          ERQ account, CM AMT. on its own account; zero amounts are skipped
   Conversion rate       = EXCHANGE RATE of the row
 BDT charges on the sheet (commission, courier, export charge, govt tax, central fund) are NOT part of this
 form, the same as the BDT debits on the HSBC/SCB/BRAC advices; they are kept in `meta` for reference.
@@ -177,18 +177,24 @@ def _parse_sheet(ws) -> list[dict]:
             other = c - margin - e - erq
         amounts = {"MARGIN": margin, "CM AMT.": e, "ERQ": erq, "MARGIN ON OTHER IMPORT OBLIGATIONS": other}
 
+        # EBL rule: "margin on other import obligations" is added to the margin account (one BTB row);
+        # CM goes to its own account, ERQ to the ERQ account.
+        margin_acct = _acct(cell(r, "MARGIN CORP."))
+        merged = amounts["MARGIN"] + amounts["MARGIN ON OTHER IMPORT OBLIGATIONS"]
+        plan = [(merged, margin_acct, "margin + margin on other import obligations"),
+                (amounts["CM AMT."], _acct(cell(r, "UGL CD")), "CM amount"),
+                (amounts["ERQ"], _acct(cell(r, "UGL ERQ")), "ERQ")]
         dists, parts = [], []
-        for amount_col_name, acct_col_name, label in DISTRIBUTIONS:
-            amt = _q(amounts[amount_col_name])
+        for raw_amt, acct, label in plan:
+            amt = _q(raw_amt)
             if amt == 0:
                 continue
-            acct = _acct(cell(r, acct_col_name))
             dists.append({"amount": amt, "ac_no": acct})
             parts.append(f"{label} {amt:,.2f} -> {acct or 'no account on the sheet'}")
         notes.append("distribution rows, in order: " + "; ".join(parts))
 
         short = _q(b - c)
-        itemized = [{"label": "Short amount (bill amount minus proceeds)", "amount": short}] if short > D("0.005") else []
+        itemized = [{"label": "Short amount", "amount": short}] if short > D("0.005") else []
 
         vd = value_dates.get(bill)
         if vd:

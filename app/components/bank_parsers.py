@@ -10,6 +10,7 @@ ERP structure produced:
   Distributions        = foreign-currency credits to the exporter's accounts
   Cumulative bill balance = Bill/Invoice Amount - (deductions + distributions)   -> must be 0
 """
+import os
 import re
 from datetime import datetime
 from decimal import Decimal as D, ROUND_HALF_UP
@@ -28,6 +29,12 @@ FX_SANITY = settings.fx_sanity
 FUND_RATE = D("0.0003")       # HSBC "RMG FUND-ECO" / BRAC "Central Fund" = 0.03% of the same BDT value
 ACCOUNT_MAP = settings.account_map   # see app/config/account_map.json
 DEDUCTION_HEAD = (ACCOUNT_MAP.get("DEDUCTION") or {}).get("account_head")
+
+
+def deduction_head_for(label: str):
+    """Head for one deduction row: 'DEDUCTION:<label>' in account_map.json, else the default 'DEDUCTION'."""
+    specific = ACCOUNT_MAP.get("DEDUCTION:" + (label or "").strip().lower()) or {}
+    return specific.get("account_head") or DEDUCTION_HEAD
 
 
 def num(s: str) -> D:
@@ -76,22 +83,63 @@ def parse_hsbc(t: str) -> dict:
     drawee = re.search(r"Drawee:\s*(.+)", t)
     tax = re.search(r"Source TAX\s+BDT\s+" + AMT, t)
     fund = re.search(r"RMG FUND-ECO\s+BDT\s+" + AMT, t)
+    currency = re.search(r"Collection Amount:\s*([A-Z]{3})", t).group(1)
+    credits = [{"ac_suffix": m[0], "amount": num(m[2])}
+               for m in re.findall(r"credited your account number \*+(\d+) for ([A-Z]{3}) " + AMT, t)]
+    # A debit in the collection's own currency (e.g. "Other Bank charges USD 25.00") is taken out of the SAME
+    # account's credit, and entered as a Deduction: distribution + deduction = collection amount.
+    labels = {num(a): l.strip() for l, a in re.findall(r"^(.+?)\s+" + currency + r"\s+" + AMT + r"\s+DR\s*$", t, re.M)}
+    items, notes = [], []
+    for suffix, ccy, amt in re.findall(r"debited your account number \*+(\d+) for ([A-Z]{3}) " + AMT, t):
+        if ccy != currency:
+            continue                       # fees in BDT are not part of the document-currency balance
+        amt = num(amt)
+        label = labels.get(amt) or "Bank charges"
+        row = next((c for c in credits if c["ac_suffix"] == suffix and c["amount"] >= amt), None)
+        items.append({"label": label, "amount": amt})
+        if row is not None:
+            row["amount"] -= amt
+            notes.append(f"{currency} {amt} ({label}) was debited from account ******{suffix}: taken off that "
+                         f"account's credit and entered as a deduction")
+        else:
+            notes.append(f"{currency} {amt} ({label}) was debited from ******{suffix}, which has no credit line: "
+                         f"not netted, please check")
+    credits = [c for c in credits if c["amount"] > 0]
+    if not items and charges:              # older layout without the debit sentence
+        items = [{"label": "Other Bank charges", "amount": num(charges.group(1))}]
     return {
+        "notes": notes,
         "beneficiary": lines[1],  # line 0 is the letter date, line 1 the addressee
         "bill_invoice_no": re.search(r"Our Reference No\.:\s*(\S+)", t).group(1),
         "received_date": datetime.strptime(value_date, "%B %d, %Y").date(),
         "currency": re.search(r"Collection Amount:\s*([A-Z]{3})", t).group(1),
         "stated_amount": num(re.search(r"Collection Amount:\s*[A-Z]{3}\s*" + AMT, t).group(1)),
         "proceeds": num(re.search(r"Proceed Received:\s*[A-Z]{3}\s*" + AMT, t).group(1)),
-        "distributions": [{"ac_suffix": m[0], "amount": num(m[2])}
-                          for m in re.findall(r"credited your account number \*+(\d+) for ([A-Z]{3}) " + AMT, t)],
-        "itemized_deductions": [{"label": "Other Bank charges", "amount": num(charges.group(1))}] if charges else [],
+        "distributions": credits,
+        "itemized_deductions": items,
         "source_tax": num(tax.group(1)) if tax else None,
         "fund": num(fund.group(1)) if fund else None,
         "fund_tolerance": D("0.02"),
         "drawee": drawee.group(1).strip() if drawee else None,
         "lc_sc_no": None,
     }
+
+
+# SCB rule: every USD credit on the advice (01130769902, 46130769901, ...) is ONE distribution row on this account
+SCB_DIST_ACCOUNT = os.getenv("SCB_DIST_ACCOUNT", "01130769902").strip()
+
+
+def merge_scb_distributions(credits: list, notes: list) -> list:
+    """Merge all foreign-currency credits into the single SCB distribution account."""
+    if not credits:
+        return credits
+    total = sum((c["amount"] for c in credits), D("0"))
+    if len(credits) > 1 or credits[0]["ac_no"] != SCB_DIST_ACCOUNT:
+        parts = "; ".join(f"{c['ac_no']} {c['amount']:,.2f}" for c in credits)
+        notes.append(f"SCB rule: all credits merged into account {SCB_DIST_ACCOUNT} ({parts} = {total:,.2f})")
+    if not any(c["ac_no"] == SCB_DIST_ACCOUNT for c in credits):
+        notes.append(f"the advice does not print account {SCB_DIST_ACCOUNT}: it was used anyway, please check")
+    return [{"ac_no": SCB_DIST_ACCOUNT, "amount": total}]
 
 
 def parse_scb(t: str) -> dict:
@@ -104,7 +152,12 @@ def parse_scb(t: str) -> dict:
     drawee = re.search(r"DRAWEE\s*:\s*(.+)", t) or re.search(r"APPLICANT\s*:\s*(.+)", t)
     # some advices state the rate they used for the tax: that is authoritative, never derive over it
     fx = re.search(r"FX RATE USED TO CALCULATE TAX\s*:\s*(\d+(?:\.\d+)?)", t)
+    notes = []
+    credits = [{"ac_no": m[0], "amount": num(m[2])}
+               for m in re.findall(r"ENTRY TO ACCOUNT\s+(\d+)\s+([A-Z]{3})\s+" + AMT + r"\s+CR", t)
+               if m[1] != "BDT"]
     return {
+        "notes": notes,
         "printed_rate": D(fx.group(1)) if fx else None,
         "beneficiary": re.split(r"\s{2,}", mgr.strip())[0],
         "bill_invoice_no": re.search(r"(?<![A-Z])OUR REF\s*:\s*(\S+)", t).group(1),
@@ -112,9 +165,7 @@ def parse_scb(t: str) -> dict:
         "currency": recv.group(1),
         "stated_amount": num(head.group(2)),
         "proceeds": num(recv.group(2)),
-        "distributions": [{"ac_no": m[0], "amount": num(m[2])}
-                          for m in re.findall(r"ENTRY TO ACCOUNT\s+(\d+)\s+([A-Z]{3})\s+" + AMT + r"\s+CR", t)
-                          if m[1] != "BDT"],
+        "distributions": merge_scb_distributions(credits, notes),
         "itemized_deductions": [],
         "source_tax": num(tax.group(1)) if tax else None,
         "fund": None, "fund_tolerance": D("0.02"),
@@ -304,8 +355,9 @@ def build_erp_record(bank: str, raw: dict) -> dict:
             notes.append(f"account lookup incomplete for {key}")
         dist_rows.append(_row(x["amount"], rate, account_head=acct.get("account_head"), ac_loan_no=ac_no))
 
-    ded_rows = [_row(d["amount"], rate, label=d["label"], account_head=DEDUCTION_HEAD) for d in deductions]
-    if ded_rows and not DEDUCTION_HEAD:
+    ded_rows = [_row(d["amount"], rate, label=d["label"], account_head=deduction_head_for(d["label"]))
+                for d in deductions]
+    if any(not r["account_head"] for r in ded_rows):
         notes.append("set the DEDUCTION account head in account_map.json to pre-fill deductions")
 
     doc_total = dist_total + sum((d["amount"] for d in deductions), D("0"))

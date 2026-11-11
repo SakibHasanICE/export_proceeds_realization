@@ -30,25 +30,38 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    shm_size: "1gb"            # Chromium crashes with the default 64 MB
     environment:
       POSTGRES_HOST: db          # overrides POSTGRES_HOST=localhost from .env inside Docker
       POSTGRES_PORT: "5432"
       BIND_HOST: 0.0.0.0
       API_PORT: "8000"           # container-side ports; host ports come from .env
-      UI_PORT: "8501"
-      API_URL: http://localhost:8000
       STAGING_DIR: /data/staging
       LOG_DIR: /data/logs
       LEDGER_XLSX: /data/exports/export_proceeds_log.xlsx   # the Excel register (see ./exports on this machine)
+      ERP_HEADLESS: "true"                                  # no display inside the container
+      ERP_STATE_FILE: /data/erp_state.json                  # saved ERP session (appdata volume)
+      ERP_SHOT_DIR: /data/exports/erp_screens               # screenshots appear in ./exports/erp_screens
+      ERP_RUN_DIR: /data/erp_runs                           # history of every robot run (appdata volume)
     volumes:
       - appdata:/data
       - ./exports:/data/exports      # the register file appears in the "exports" folder next to this file
     ports:
       - "127.0.0.1:${API_PORT:-8001}:8000"
-      - "127.0.0.1:${UI_PORT:-8502}:8501"
     depends_on:
       db:
         condition: service_healthy
+
+  web:                                   # the Next.js front end (replaces the Streamlit UI)
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      API_URL: http://app:8000             # server-side only: the browser never talks to the API directly
+      API_KEY: ${API_KEY:-}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3002}:3000"
+    depends_on:
+      - app
 
 volumes:
   pgdata:
