@@ -47,6 +47,10 @@ table.main th, table.main td { padding: 8px 10px; border-bottom: 1px solid var(-
 table.main th { position: sticky; top: 0; background: #eef1f6; color: var(--muted); font-weight: 500; font-size: 12px; z-index: 2; }
 table.main th.num { text-align: right; }
 table.main tbody tr:hover > td { background: #f3f6fb; }
+table.main tbody tr:not(.detail-row) { cursor: pointer; }
+/* clicked row: stays tinted (must stay below the hover rule so it wins when hovered too) */
+table.main tbody tr.row-selected > td { background: #fff5cc; }
+table.main tbody tr.row-selected > td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
 .row-active > td { background: #e6f0ff !important; }
 .stick-l { position: sticky; left: 0; background: var(--panel); z-index: 1; width: 34px; }
 .stick-r { position: sticky; right: 0; background: var(--panel); z-index: 1; box-shadow: -8px 0 8px -8px rgba(0, 0, 0, .18); }

@@ -1,5 +1,5 @@
 "use client";
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import { DbStatus, ErpBadge } from "./Badges";
 import { dmy, money, rate } from "../lib/format";
 
@@ -124,6 +124,8 @@ function remarkFor(e) {
 }
 
 export default function EntriesTable({ entries, accounts, showLines, activeIds, highlightId, onRun, onOpenRun, expanded, onToggle }) {
+  // The row the user clicked: stays tinted so it is easy to follow while scrolling sideways
+  const [selectedId, setSelectedId] = useState(null);
   if (entries.length === 0) return <div className="empty">No documents match the filter.</div>;
   return (
     <div className="table-wrap">
@@ -164,7 +166,14 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
             const reason = !e.can_run ? e.blockers.join("; ") : isActive ? "Already queued or running" : "";
             return (
               <Fragment key={e.id}>
-                <tr className={isActive ? "row-active" : e.id === highlightId ? "row-new" : ""}>
+                <tr
+                  className={[isActive ? "row-active" : e.id === highlightId ? "row-new" : "", e.id === selectedId ? "row-selected" : ""].join(" ").trim()}
+                  onClick={(ev) => {
+                    // click a row to mark it; click it again (not on a button) to clear
+                    const onControl = ev.target.closest("button, a, input, select");
+                    setSelectedId((cur) => (cur === e.id && !onControl ? null : e.id));
+                  }}
+                >
                   <td className="stick-l">
                     <button className="chev" onClick={() => onToggle(e.id)} title="Show / hide the line details">
                       {open ? "▾" : "▸"}

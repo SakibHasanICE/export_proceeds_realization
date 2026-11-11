@@ -1082,6 +1082,25 @@ def build_verification(payload: dict, header: dict, ded: dict, dist: dict) -> di
     if bal["status"] == "error":
         bal["note"] = "the bill is not fully distributed: check the bill amount and the distribution rows"
     checks.append(bal)
+
+    # Independent balance rule, worked out from what the ERP itself shows (not from our database):
+    # Bill/Invoice Amount (filled by the ERP when the bill is picked) = Deductions + Distributions (document currency)
+    def _erp_total(section: dict) -> float:
+        tot = (section.get("totals") or [None])[0]
+        if _num(tot) is not None:
+            return _num(tot)
+        return sum(_num(r.get("Document Currency")) or 0.0 for r in (section.get("rows") or []))
+
+    erp_bill = _num(header.get("txt_bill_invoice_amnt"))
+    erp_sum = round(_erp_total(ded) + _erp_total(dist), 2)
+    rule = _check("Totals", "Bill/Invoice Amount = Deductions + Distributions", erp_bill, f"{erp_sum:.2f}", "num")
+    if erp_bill is None:
+        rule.update(status="error", note="the ERP did not fill the Bill/Invoice Amount, so the balance cannot be checked")
+    elif rule["status"] == "error":
+        rule["note"] = (f"deductions + distributions in the ERP are {erp_sum:,.2f} but the bill amount the ERP filled in "
+                        f"is {erp_bill:,.2f} (difference {erp_bill - erp_sum:,.2f})")
+    checks.append(rule)
+
     checks.append(_check("Totals", "Grand Total - Domestic Currency", gt.get("Domestic Currency"),
                          header.get("grand_total_domestic_currency"), "domestic"))
 
