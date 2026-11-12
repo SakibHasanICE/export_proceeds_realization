@@ -39,8 +39,8 @@ class RunRequest(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=100)
 
 
-def build_router(require_key) -> APIRouter:
-    router = APIRouter(prefix="/erp", dependencies=[Depends(require_key)])
+def build_router(require_key, current_user) -> APIRouter:
+    router = APIRouter(prefix="/erp", dependencies=[Depends(require_key), Depends(current_user)])
 
     @router.get("/entries")
     def entries(status: Optional[str] = None, needs_review: Optional[bool] = None):
@@ -56,7 +56,7 @@ def build_router(require_key) -> APIRouter:
                 "erp_configured": bool(os.getenv("ERP_USERNAME") and os.getenv("ERP_PASSWORD"))}
 
     @router.post("/runs")
-    def start_runs(body: RunRequest):
+    def start_runs(body: RunRequest, user: Optional[str] = Depends(current_user)):
         """Queue one run per entry. Runs happen one after another; nothing is ever saved in the ERP."""
         mgr = get_manager()
         ok, skipped = [], []
@@ -71,6 +71,10 @@ def build_router(require_key) -> APIRouter:
                 continue
             ok.append({"entry_id": eid, "bill_no": rec["bill_invoice_no"], "bank": rec["bank"]})
         res = mgr.submit(ok) if ok else {"batch_id": None, "jobs": [], "skipped": []}
+        not_queued = {s["entry_id"] for s in res["skipped"]}
+        for item in ok:                      # remember when and who pressed the button, for the table
+            if item["entry_id"] not in not_queued:
+                database.record_erp_click(item["entry_id"], user)
         res["skipped"] = skipped + res["skipped"]
         return res
 

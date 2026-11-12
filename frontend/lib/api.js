@@ -10,6 +10,7 @@ export async function api(path, opts = {}) {
   } catch (e) {
     data = null;
   }
+  if (r.status === 401 && typeof window !== "undefined") window.location.href = "/login"; // signed out
   if (!r.ok) {
     const d = data && data.detail;
     throw new Error(typeof d === "string" ? d : d ? JSON.stringify(d) : `HTTP ${r.status}`);

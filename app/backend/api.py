@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.common.custom_exception import CustomException
 from app.common.logger import get_logger
+from app.backend.auth import current_user
 from app.backend.erp_api import build_router as build_erp_router
 from app.components import database, pipeline
 from app.config.settings import settings
@@ -35,7 +36,7 @@ def require_key(x_api_key: Optional[str] = Header(default=None)):
 
 
 app = FastAPI(title="Export Proceeds Realization Automation", lifespan=lifespan)
-router = APIRouter(dependencies=[Depends(require_key)])
+router = APIRouter(dependencies=[Depends(require_key), Depends(current_user)])
 
 
 class DistributionIn(BaseModel):
@@ -165,4 +166,4 @@ def other_documents():
 
 
 app.include_router(router)
-app.include_router(build_erp_router(require_key))
+app.include_router(build_erp_router(require_key, current_user))

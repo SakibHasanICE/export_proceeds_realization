@@ -49,10 +49,11 @@ table.main th.num { text-align: right; }
 table.main tbody tr:hover > td { background: #f3f6fb; }
 table.main tbody tr:not(.detail-row) { cursor: pointer; }
 /* clicked row: stays tinted (must stay below the hover rule so it wins when hovered too) */
+table.main tbody tr.row-checked > td { background: #e8f1ff; }   /* ticked for "Proceed selected" */
 table.main tbody tr.row-selected > td { background: #fff5cc; }
 table.main tbody tr.row-selected > td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
 .row-active > td { background: #e6f0ff !important; }
-.stick-l { position: sticky; left: 0; background: var(--panel); z-index: 1; width: 34px; }
+.stick-l { position: sticky; left: 0; background: var(--panel); z-index: 1; width: 62px; min-width: 62px; }
 .stick-r { position: sticky; right: 0; background: var(--panel); z-index: 1; box-shadow: -8px 0 8px -8px rgba(0, 0, 0, .18); }
 th.stick-l, th.stick-r { z-index: 3; background: #eef1f6; }
 .chev { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; }
@@ -168,3 +169,22 @@ td.remark { white-space: normal !important; min-width: 170px; max-width: 300px; 
 .guide-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 14px; }
 .guide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }
 .guide table.sub td:first-child { white-space: nowrap; vertical-align: top; width: 1%; }
+
+/* first cell: checkbox + expand arrow */
+.firstcell { display: flex; align-items: center; gap: 4px; }
+.firstcell input { cursor: pointer; margin: 0; }
+.firstcell input:disabled { cursor: not-allowed; }
+
+/* header: title on the left, signed-in user on the right */
+.top-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.usermenu { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+
+/* footer buttons */
+.footbtns { display: flex; align-items: center; gap: 14px; }
+
+/* sign-in page */
+.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.login-card { width: 100%; max-width: 420px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 28px; display: flex; flex-direction: column; gap: 14px; }
+.login-card h1 { margin: 0; font-size: 22px; }
+.login-card p { margin: 0; }

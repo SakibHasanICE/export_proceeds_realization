@@ -380,6 +380,22 @@ def mark_filled(rid: int, note: str | None = None) -> dict | None:
         return _to_dict(r)
 
 
+def record_erp_click(rid: int, user: str | None) -> None:
+    """Someone pressed Proceed to ERP / Run again for this entry: remember when and who (last click + a short log).
+    Kept inside meta (JSON), so existing databases need no migration."""
+    with get_session() as s:
+        r = s.get(Realization, rid)
+        if r is None:
+            return
+        now = _now().isoformat()
+        meta = dict(r.meta or {})
+        log = list(meta.get("erp_click_log") or [])[-19:]
+        log.append({"at": now, "by": user})
+        meta.update({"erp_clicked_at": now, "erp_clicked_by": user, "erp_click_log": log})
+        r.meta = meta          # new dict, so SQLAlchemy sees the change
+        s.commit()
+
+
 def erp_payload(d: dict) -> dict:
     """Shaped like the ERP 'Export Proceeds Realization Entry' form (dd-mm-yyyy dates)."""
     fmt = lambda iso: date.fromisoformat(iso).strftime("%d-%m-%Y") if iso else None

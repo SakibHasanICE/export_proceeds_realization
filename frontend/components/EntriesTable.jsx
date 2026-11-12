@@ -1,7 +1,7 @@
 "use client";
 import { Fragment, useState } from "react";
 import { DbStatus, ErpBadge } from "./Badges";
-import { dmy, money, rate } from "../lib/format";
+import { dmy, money, rate, stamp } from "../lib/format";
 
 function Head({ row }) {
   if (row.account_head) {
@@ -123,16 +123,30 @@ function remarkFor(e) {
   return e.remark || null;
 }
 
-export default function EntriesTable({ entries, accounts, showLines, activeIds, highlightId, onRun, onOpenRun, expanded, onToggle }) {
+export default function EntriesTable({ entries, accounts, showLines, activeIds, highlightId, onRun, onOpenRun, expanded, onToggle,
+  selected, onSelect, onSelectAll }) {
   // The row the user clicked: stays tinted so it is easy to follow while scrolling sideways
   const [selectedId, setSelectedId] = useState(null);
   if (entries.length === 0) return <div className="empty">No documents match the filter.</div>;
+  const pickable = entries.filter((e) => e.can_run && !activeIds.has(e.id));
+  const pickedCount = pickable.filter((e) => selected.has(e.id)).length;
   return (
     <div className="table-wrap">
       <table className="main">
         <thead>
           <tr>
-            <th className="stick-l" />
+            <th className="stick-l">
+              <div className="firstcell">
+                <input
+                  type="checkbox"
+                  title="Select every document that is ready to send"
+                  disabled={pickable.length === 0}
+                  checked={pickable.length > 0 && pickedCount === pickable.length}
+                  ref={(el) => { if (el) el.indeterminate = pickedCount > 0 && pickedCount < pickable.length; }}
+                  onChange={onSelectAll}
+                />
+              </div>
+            </th>
             <th>ID</th>
             <th>Bank</th>
             <th>Bill/Invoice No</th>
@@ -155,6 +169,9 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
             <th>Status</th>
             <th>ERP run</th>
             <th>Remarks</th>
+            <th title="When this document was stored and appeared in the table">Arrived</th>
+            <th title="When someone last pressed Proceed to ERP / Run again for this document">Proceed clicked</th>
+            <th title="The signed-in user who pressed it">Clicked by</th>
             <th className="stick-r">Action</th>
           </tr>
         </thead>
@@ -164,10 +181,11 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
             const open = showLines || expanded.has(e.id);
             const bal = e.totals.cumulative_bill_balance;
             const reason = !e.can_run ? e.blockers.join("; ") : isActive ? "Already queued or running" : "";
+            const canPick = e.can_run && !isActive;
             return (
               <Fragment key={e.id}>
                 <tr
-                  className={[isActive ? "row-active" : e.id === highlightId ? "row-new" : "", e.id === selectedId ? "row-selected" : ""].join(" ").trim()}
+                  className={[isActive ? "row-active" : e.id === highlightId ? "row-new" : "", selected.has(e.id) && canPick ? "row-checked" : "", e.id === selectedId ? "row-selected" : ""].join(" ").trim()}
                   onClick={(ev) => {
                     // click a row to mark it; click it again (not on a button) to clear
                     const onControl = ev.target.closest("button, a, input, select");
@@ -175,9 +193,18 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
                   }}
                 >
                   <td className="stick-l">
-                    <button className="chev" onClick={() => onToggle(e.id)} title="Show / hide the line details">
-                      {open ? "▾" : "▸"}
-                    </button>
+                    <div className="firstcell">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(e.id) && canPick}
+                        disabled={!canPick}
+                        title={canPick ? "Select this document for “Proceed selected to ERP”" : reason || "Cannot be selected"}
+                        onChange={() => onSelect(e.id)}
+                      />
+                      <button className="chev" onClick={() => onToggle(e.id)} title="Show / hide the line details">
+                        {open ? "▾" : "▸"}
+                      </button>
+                    </div>
                   </td>
                   <td className="mono">{e.id}</td>
                   <td>{e.bank}</td>
@@ -211,6 +238,9 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
                       return rk ? <span className={"rk rk-" + rk.level} title={rk.text}>{rk.text}</span> : null;
                     })()}
                   </td>
+                  <td className="mono small">{stamp(e.created_at)}</td>
+                  <td className="mono small">{e.erp_clicked_at ? stamp(e.erp_clicked_at) : <span className="muted">—</span>}</td>
+                  <td className="small">{e.erp_clicked_by || <span className="muted">—</span>}</td>
                   <td className="stick-r">
                     {e.status === "filled" ? (
                       <span className="saved">✓ Saved in ERP</span>
@@ -228,7 +258,7 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
                 </tr>
                 {open && (
                   <tr className="detail-row">
-                    <td colSpan={19 + accounts.length}><Lines e={e} /></td>
+                    <td colSpan={22 + accounts.length}><Lines e={e} /></td>
                   </tr>
                 )}
               </Fragment>

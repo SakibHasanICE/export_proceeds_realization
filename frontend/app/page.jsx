@@ -4,6 +4,7 @@ import EntriesTable from "../components/EntriesTable";
 import RunTracker from "../components/RunTracker";
 import StatusGuide from "../components/StatusGuide";
 import UploadButton from "../components/UploadButton";
+import UserMenu from "../components/UserMenu";
 import { uploadFiles } from "../lib/upload";
 import { api, post } from "../lib/api";
 import { ACTIVE } from "../lib/format";
@@ -24,6 +25,7 @@ export default function Page() {
   const [highlightId, setHighlightId] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
+  const [selected, setSelected] = useState(new Set()); // ids ticked for "Proceed selected to ERP"
   const noticeTimer = useRef(null);
 
   const flash = useCallback((msg, ms = 7000) => {
@@ -87,6 +89,8 @@ export default function Page() {
   }, [visible]);
 
   const runnable = visible.filter((e) => e.can_run && !activeIds.has(e.id));
+  // only rows that are still visible and still ready count, so nothing hidden by a filter is sent by accident
+  const picked = runnable.filter((e) => selected.has(e.id));
 
   async function run(ids) {
     try {
@@ -101,6 +105,35 @@ export default function Page() {
     } catch (e) {
       flash(`Could not start: ${e.message}`, 12000);
     }
+  }
+
+  function toggleSelect(id) {
+    setSelected((old) => {
+      const n = new Set(old);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  }
+
+  function toggleSelectAll() {
+    setSelected((old) => {
+      const n = new Set(old);
+      if (runnable.every((e) => n.has(e.id))) runnable.forEach((e) => n.delete(e.id));
+      else runnable.forEach((e) => n.add(e.id));
+      return n;
+    });
+  }
+
+  function runSelected() {
+    if (picked.length === 0) return;
+    const ok = window.confirm(
+      `Fill the ${picked.length} selected document(s) in the ERP, one after another?\n\n` +
+        "The robot only fills the forms and takes screenshots. It never clicks Save."
+    );
+    if (!ok) return;
+    run(picked.map((e) => e.id));
+    setSelected(new Set());
   }
 
   function runAll() {
@@ -156,11 +189,14 @@ export default function Page() {
       onDrop={(e) => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files.length) dropFiles(e.dataTransfer.files); }}
     >
       <div className="content">
-        <header className="top">
-          <h1>Export Proceeds Realization</h1>
-          <div className="muted">
-            Review what will be filled, then send it to the ERP. <b>Test mode: nothing is ever saved in the ERP.</b>
+        <header className="top top-row">
+          <div>
+            <h1>Export Proceeds Realization</h1>
+            <div className="muted">
+              Review what will be filled, then send it to the ERP. <b>Test mode: nothing is ever saved in the ERP.</b>
+            </div>
           </div>
+          <UserMenu />
         </header>
 
         {!erpConfigured && (
@@ -203,6 +239,9 @@ export default function Page() {
             highlightId={highlightId}
             onRun={run}
             onOpenRun={(r) => setTracker({ batchId: null, jobId: r.id })}
+            selected={selected}
+            onSelect={toggleSelect}
+            onSelectAll={toggleSelectAll}
           />
         )}
         <div className="spacer-bottom" />
@@ -222,9 +261,23 @@ export default function Page() {
           <b>{runnable.length}</b> of {visible.length} shown document(s) are ready to send.
           <span className="muted"> The robot works one by one and never saves.</span>
         </div>
-        <button className="btn btn-primary btn-big" disabled={runnable.length === 0} onClick={runAll}>
-          Proceed all to ERP ({runnable.length})
-        </button>
+        <div className="footbtns">
+          {picked.length > 0 && (
+            <>
+              <button className="link" onClick={() => setSelected(new Set())}>Clear selection</button>
+              <button className="btn btn-primary btn-big" onClick={runSelected}>
+                Proceed selected to ERP ({picked.length})
+              </button>
+            </>
+          )}
+          <button
+            className={"btn btn-big " + (picked.length > 0 ? "" : "btn-primary")}
+            disabled={runnable.length === 0}
+            onClick={runAll}
+          >
+            Proceed all to ERP ({runnable.length})
+          </button>
+        </div>
       </footer>
     </main>
   );

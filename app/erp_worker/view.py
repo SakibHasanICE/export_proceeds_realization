@@ -137,6 +137,8 @@ def build_erp_view(rec: dict) -> dict:
         "id": rec["id"], "bank": rec.get("bank"), "bill_invoice_no": rec.get("bill_invoice_no"),
         "status": rec.get("status"), "needs_review": rec.get("needs_review"),
         "source_file": rec.get("source_file"), "created_at": rec.get("created_at"),
+        "erp_clicked_at": (rec.get("meta") or {}).get("erp_clicked_at"),
+        "erp_clicked_by": (rec.get("meta") or {}).get("erp_clicked_by"),
         "beneficiary": rec.get("beneficiary"), "buyer": rec.get("buyer"), "lc_sc_no": rec.get("lc_sc_no"),
         "received_date": rec.get("received_date"), "bill_invoice_date": rec.get("bill_invoice_date"),
         "currency": rec.get("currency"), "bill_invoice_amount": rec.get("bill_invoice_amount"),

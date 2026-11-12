@@ -55,6 +55,7 @@ services:
   web:                                   # the Next.js front end (replaces the Streamlit UI)
     build: ./frontend
     restart: unless-stopped
+    env_file: .env
     environment:
       API_URL: http://app:8000             # server-side only: the browser never talks to the API directly
       API_KEY: ${API_KEY:-}

@@ -1,12 +1,18 @@
 // Browser -> Next.js -> FastAPI. The API key and the backend address stay on the server.
+import { getServerSession } from "next-auth";
+import { authOptions } from "../../../lib/auth";
+
 export const dynamic = "force-dynamic";
 
 const API = (process.env.API_URL || "http://localhost:8000").replace(/\/$/, "");
 
 async function handler(req, ctx) {
+  const session = await getServerSession(authOptions);
+  const email = session && session.user && session.user.email ? session.user.email.toLowerCase() : null;
+  if (!email) return Response.json({ detail: "Please sign in." }, { status: 401 });
   const { path } = await ctx.params;
   const url = `${API}/${(path || []).join("/")}${new URL(req.url).search}`;
-  const headers = {};
+  const headers = { "X-User-Email": email }; // the backend records who pressed Proceed to ERP
   if (process.env.API_KEY) headers["X-API-Key"] = process.env.API_KEY;
   const ct = req.headers.get("content-type");
   if (ct) headers["content-type"] = ct;

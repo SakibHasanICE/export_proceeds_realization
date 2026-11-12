@@ -98,6 +98,9 @@ class Settings:
     api_port = int(os.getenv("API_PORT", "8000"))
     ui_port = int(os.getenv("UI_PORT", "8501"))
     api_key = os.getenv("API_KEY", "")   # if set, API requires header X-API-Key
+    # Google Workspace domain whose staff may use the UI (e.g. urmigroup.net). When set, every API call must carry
+    # the signed-in user's address in X-User-Email (the Next.js server adds it after Google sign-in). Empty = off.
+    allowed_email_domain = os.getenv("ALLOWED_EMAIL_DOMAIN", "").strip().lower().lstrip("@")
     log_dir = Path(os.getenv("LOG_DIR", BASE_DIR / "logs"))
 
 
