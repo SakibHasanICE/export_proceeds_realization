@@ -523,3 +523,150 @@ def delete_erp_credential(email: str) -> bool:
         s.delete(row)
         s.commit()
         return True
+
+
+# ---------------------------------------------------------------- paginated list (the web page: 100 per page)
+def _entry_filters(owner_email, status, search, owner_filter):
+    from sqlalchemy import cast, or_
+    conds = []
+    if owner_email is not None:                     # a normal user: only their own
+        conds.append(Realization.owner_email == owner_email)
+    elif owner_filter == "none":                    # master picked "no owner"
+        conds.append(Realization.owner_email.is_(None))
+    elif owner_filter and owner_filter != "all":    # master picked one user
+        conds.append(Realization.owner_email == owner_filter.lower())
+    if status and status != "all":
+        conds.append(Realization.status == status)
+    q = (search or "").strip()
+    if q:
+        pat = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        cols = [cast(Realization.id, String), Realization.bank, Realization.bill_invoice_no, Realization.beneficiary,
+                Realization.buyer, Realization.lc_sc_no, Realization.owner_email]
+        conds.append(or_(*[c.ilike(pat, escape="\\") for c in cols]))
+    return conds
+
+
+def query_realizations(owner_email: str | None = None, status: str | None = None, search: str | None = None,
+                       owner_filter: str | None = None, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
+    """(rows newest first, total matching). limit=None returns every match (used when the 'ready' filter needs them all)."""
+    from sqlalchemy import func
+    conds = _entry_filters(owner_email, status, search, owner_filter)
+    with get_session() as s:
+        total = s.scalar(select(func.count()).select_from(Realization).where(*conds)) or 0
+        q = select(Realization).where(*conds).order_by(Realization.id.desc()).offset(offset)
+        if limit is not None:
+            q = q.limit(limit)
+        return [_to_dict(r) for r in s.scalars(q)], total
+
+
+def distinct_owners() -> list[str]:
+    with get_session() as s:
+        return sorted(o for o in s.scalars(select(Realization.owner_email).distinct()) if o)
+
+
+# ---------------------------------------------------------------- user edits of one value ("edited" is remembered)
+_EDIT_TEXT = {"beneficiary", "buyer", "lc_sc_no", "bill_invoice_no"}
+_EDIT_DATES = {"received_date", "bill_invoice_date"}
+
+
+def _amount(value, what: str, allow_zero: bool = False) -> Decimal:
+    try:
+        d = Decimal(str(value).replace(",", "").strip())
+    except Exception:
+        raise ValueError(f"{what}: '{value}' is not a number")
+    if d < 0 or (d == 0 and not allow_zero):
+        raise ValueError(f"{what} must be {'zero or more' if allow_zero else 'more than zero'}")
+    return d
+
+
+def _fmt_rate(v) -> str:
+    return "" if v is None else format(Decimal(str(v)).normalize(), "f")
+
+
+def edit_entry(rid: int, field: str, value, user: str | None = None) -> dict | None:
+    """Change ONE value of a pending entry the way the user typed it, and remember that it was edited.
+
+    meta['edited'][field] = {original, by, at}: the ORIGINAL (processed) value is kept from the first edit on, and
+    the mark disappears again when the value is put back to it. field: a column name, 'deductions' (when the entry
+    has exactly one deduction line) or 'dist:<account no>' (an existing distribution line; 0 removes the line)."""
+    with get_session() as s:
+        r = s.get(Realization, rid)
+        if r is None:
+            return None
+        if r.status != "pending":
+            raise ValueError(f"This entry is {r.status}: only pending entries can be edited.")
+        if field in _EDIT_TEXT:
+            new = (str(value).strip() if value is not None else "") or None
+            if field == "bill_invoice_no" and not new:
+                raise ValueError("Bill/Invoice No cannot be empty.")
+            before, after = getattr(r, field) or "", new or ""
+            setattr(r, field, new)
+        elif field in _EDIT_DATES:
+            try:
+                new = date.fromisoformat(str(value).strip()[:10]) if value not in (None, "") else None
+            except ValueError:
+                raise ValueError("Enter the date as day-month-year.")
+            before = getattr(r, field).isoformat() if getattr(r, field) else ""
+            after = new.isoformat() if new else ""
+            setattr(r, field, new)
+        elif field == "bill_invoice_amount":
+            new = _q2(_amount(value, "Bill Amount"))
+            before = f"{_q2(r.bill_invoice_amount):.2f}" if r.bill_invoice_amount is not None else ""
+            after = f"{new:.2f}"
+            r.bill_invoice_amount = new
+        elif field == "conversion_rate":
+            new = _amount(value, "Rate")
+            before, after = _fmt_rate(r.conversion_rate), _fmt_rate(new)
+            r.conversion_rate = new
+        elif field == "deductions":
+            rows = list(r.deductions)
+            if len(rows) != 1:
+                raise ValueError("This entry has " + ("no" if not rows else "several") +
+                                 " deduction lines, so the total cannot be edited as one value.")
+            new = _q2(_amount(value, "Deductions", allow_zero=True))
+            before, after = f"{_q2(rows[0].document_currency):.2f}", f"{new:.2f}"
+            rows[0].document_currency = new
+        elif field.startswith("dist:"):
+            ac = field[5:]
+            rows = [d for d in r.distributions if d.ac_loan_no == ac]
+            if len(rows) != 1:
+                raise ValueError("Only an account with exactly one distribution line can be edited here.")
+            new = _q2(_amount(value, "Amount", allow_zero=True))
+            before, after = f"{_q2(rows[0].document_currency):.2f}", f"{new:.2f}"
+            if new == 0:
+                r.distributions.remove(rows[0])
+            else:
+                rows[0].document_currency = new
+        else:
+            raise ValueError("This value cannot be edited.")
+
+        meta = dict(r.meta or {})
+        edited = dict(meta.get("edited") or {})
+        original = (edited.get(field) or {}).get("original", before)
+        if after == original:
+            edited.pop(field, None)                      # put back to the processed value: no longer "edited"
+        else:
+            edited[field] = {"original": original, "by": user, "at": _now().isoformat()}
+        if edited:
+            meta["edited"] = edited
+        else:
+            meta.pop("edited", None)
+        r.meta = meta
+
+        total = Decimal("0")                              # domestic = document x rate, for every line
+        for d in list(r.deductions) + list(r.distributions):
+            if r.conversion_rate is not None:
+                d.conversion_rate = r.conversion_rate
+                d.domestic_currency = _q2(Decimal(str(d.document_currency)) * Decimal(str(r.conversion_rate)))
+                total += d.domestic_currency
+            else:
+                d.conversion_rate = d.domestic_currency = None
+        r.total_domestic = total if r.conversion_rate is not None else None
+        r.updated_at = _now()
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            raise ValueError("Another entry of this bank already has this Bill/Invoice No.")
+        log.info("entry %s: %s edited by %s (%r -> %r)", rid, field, user, before, after)
+        return _to_dict(r)

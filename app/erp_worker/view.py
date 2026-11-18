@@ -143,6 +143,7 @@ def build_erp_view(rec: dict) -> dict:
         "status": rec.get("status"), "needs_review": rec.get("needs_review"),
         "source_file": rec.get("source_file"), "created_at": rec.get("created_at"),
         "owner_email": rec.get("owner_email"),
+        "edited": (rec.get("meta") or {}).get("edited") or {},       # {field: {original, by, at}}: values a user changed
         "save_state": save_state,
         "erp_clicked_at": (rec.get("meta") or {}).get("erp_clicked_at"),
         "erp_clicked_by": (rec.get("meta") or {}).get("erp_clicked_by"),

@@ -1,5 +1,5 @@
 "use client";
-import { Fragment } from "react";
+import { Fragment, useRef, useState } from "react";
 import { DbStatus, ErpBadge } from "./Badges";
 import { dmy, money, rate, stamp } from "../lib/format";
 
@@ -110,6 +110,67 @@ function Lines({ e, saveEnabled }) {
   );
 }
 
+// A table cell the user can correct by double-clicking it. A value that was changed shows "(edited)" under it.
+function EditCell({ e, field, kind = "text", value, canEdit, onEdit, className = "", children }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const cancelled = useRef(false);
+  const info = (e.edited || {})[field];
+  const current = kind === "date" ? String(value || "").slice(0, 10) : value === null || value === undefined ? "" : String(value);
+
+  function start() {
+    cancelled.current = false;
+    setDraft(current);
+    setEditing(true);
+  }
+
+  async function commit() {
+    if (cancelled.current || busy) return;
+    if (draft.trim() === current.trim()) {
+      setEditing(false);
+      return;
+    }
+    setBusy(true);
+    const ok = await onEdit(e.id, field, draft.trim());
+    setBusy(false);
+    if (ok !== false) setEditing(false);
+  }
+
+  const tip = info
+    ? `Edited${info.by ? " by " + info.by : ""}. Processed value was: ${info.original === "" ? "(empty)" : info.original}`
+    : canEdit
+    ? "Double-click to edit"
+    : undefined;
+
+  return (
+    <td className={(className + (canEdit ? " editable" : "")).trim()} title={tip} onDoubleClick={canEdit && !editing ? start : undefined}>
+      {editing ? (
+        <input
+          className="cell-input"
+          autoFocus
+          disabled={busy}
+          type={kind === "date" ? "date" : "text"}
+          inputMode={kind === "number" ? "decimal" : undefined}
+          value={draft}
+          onChange={(ev) => setDraft(ev.target.value)}
+          onBlur={commit}
+          onKeyDown={(ev) => {
+            if (ev.key === "Enter") commit();
+            if (ev.key === "Escape") {
+              cancelled.current = true;
+              setEditing(false);
+            }
+          }}
+        />
+      ) : (
+        children
+      )}
+      {info && !editing && <span className="edited-tag">(edited)</span>}
+    </td>
+  );
+}
+
 // Amount an entry distributes to one account (sum, in case the same account appears twice)
 function acctAmount(e, no) {
   const rows = e.distributions.filter((d) => d.ac_loan_no === no);
@@ -128,7 +189,7 @@ function remarkFor(e) {
 }
 
 export default function EntriesTable({ entries, accounts, showLines, activeIds, highlightId, onRun, onOpenRun, expanded, onToggle,
-  selected, onSelect, onSelectAll, saveEnabled, onResolve, showOwner }) {
+  selected, onSelect, onSelectAll, saveEnabled, onResolve, showOwner, onEdit }) {
   if (entries.length === 0) return <div className="empty">No documents match the filter.</div>;
   const pickable = entries.filter((e) => e.can_run && !activeIds.has(e.id));
   const pickedCount = pickable.filter((e) => selected.has(e.id)).length;
@@ -185,6 +246,8 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
             const bal = e.totals.cumulative_bill_balance;
             const reason = !e.can_run ? e.blockers.join("; ") : isActive ? "Already queued or running" : "";
             const canPick = e.can_run && !isActive;
+            const canEdit = !!onEdit && e.status === "pending" && !isActive;   // only entries not yet saved in the ERP
+            const ed = { e, canEdit, onEdit };
             return (
               <Fragment key={e.id}>
                 <tr
@@ -212,22 +275,29 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
                   <td className="mono">{e.id}</td>
                   {showOwner && <td className="small">{e.owner_email || <span className="muted">—</span>}</td>}
                   <td>{e.bank}</td>
-                  <td className="mono strong">{e.bill_invoice_no}</td>
-                  <td>{e.beneficiary || <span className="muted">—</span>}</td>
-                  <td>{e.buyer || <span className="muted">—</span>}</td>
-                  <td>{e.lc_sc_no || <span className="muted">—</span>}</td>
-                  <td>{dmy(e.received_date)}</td>
-                  <td>{dmy(e.bill_invoice_date)}</td>
+                  <EditCell {...ed} field="bill_invoice_no" value={e.bill_invoice_no} className="mono strong">{e.bill_invoice_no}</EditCell>
+                  <EditCell {...ed} field="beneficiary" value={e.beneficiary}>{e.beneficiary || <span className="muted">—</span>}</EditCell>
+                  <EditCell {...ed} field="buyer" value={e.buyer}>{e.buyer || <span className="muted">—</span>}</EditCell>
+                  <EditCell {...ed} field="lc_sc_no" value={e.lc_sc_no}>{e.lc_sc_no || <span className="muted">—</span>}</EditCell>
+                  <EditCell {...ed} field="received_date" kind="date" value={e.received_date}>{dmy(e.received_date)}</EditCell>
+                  <EditCell {...ed} field="bill_invoice_date" kind="date" value={e.bill_invoice_date}>{dmy(e.bill_invoice_date)}</EditCell>
                   <td>{e.currency}</td>
-                  <td className="num">{money(e.bill_invoice_amount)}</td>
-                  <td className="num">{rate(e.conversion_rate)}</td>
-                  <td className="num">{money(e.totals.deductions_document)}</td>
+                  <EditCell {...ed} field="bill_invoice_amount" kind="number" value={e.bill_invoice_amount} className="num">{money(e.bill_invoice_amount)}</EditCell>
+                  <EditCell {...ed} field="conversion_rate" kind="number" value={e.conversion_rate} className="num">{rate(e.conversion_rate)}</EditCell>
+                  <EditCell
+                    {...ed}
+                    canEdit={canEdit && e.deductions.length === 1}
+                    field="deductions" kind="number" value={e.totals.deductions_document} className="num"
+                  >
+                    {money(e.totals.deductions_document)}
+                  </EditCell>
                   {accounts.map((a) => {
                     const v = acctAmount(e, a.no);
+                    const lines = e.distributions.filter((d) => d.ac_loan_no === a.no).length;
                     return (
-                      <td key={a.no} className="num">
+                      <EditCell {...ed} key={a.no} canEdit={canEdit && lines === 1} field={"dist:" + a.no} kind="number" value={v} className="num">
                         {v === null ? <span className="muted">—</span> : money(v)}
-                      </td>
+                      </EditCell>
                     );
                   })}
                   <td className="num">{money(e.totals.distributions_document)}</td>

@@ -44,6 +44,14 @@ class RunRequest(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=100)
 
 
+PAGE_SIZE = 100          # entries per page
+
+
+class CellEdit(BaseModel):
+    field: str = Field(min_length=1, max_length=60)
+    value: Optional[str] = Field(default=None, max_length=300)
+
+
 class ErpLoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=200)
     password: str = Field(min_length=1, max_length=200)
@@ -69,24 +77,55 @@ def build_router(require_key, current_user) -> APIRouter:
         return rec is not None and can_access(rec.get("owner_email"), user)
 
     @router.get("/entries")
-    def entries(status: Optional[str] = None, needs_review: Optional[bool] = None,
-                user: Optional[str] = Depends(current_user)):
+    def entries(page: int = 1, status: Optional[str] = None, search: str = "", owner: str = "all",
+                only_ready: bool = False, user: Optional[str] = Depends(current_user)):
+        """One page (100) of this user's entries, newest first. Search / status / owner filters work on ALL pages.
+"""
         mgr = get_manager()
         latest = mgr.latest_by_entry()
-        rows = sorted(database.list_realizations(status, needs_review, owner_email=owner_scope(user)),
-                      key=lambda r: r["id"], reverse=True)
-        out = []
-        for rec in rows:
+        args = dict(owner_email=owner_scope(user), status=status, search=search, owner_filter=owner)
+        page = max(1, page)
+
+        def view(rec):
             v = build_erp_view(rec)
             v["last_run"] = latest.get(rec["id"])
-            out.append(v)
+            return v
+
+        if only_ready:                       # "ready" is computed per entry, so every match is checked, then paged
+            rows, _ = database.query_realizations(**args)
+            ready = [v for v in map(view, rows) if v["can_run"]]
+            total = len(ready)
+            pages = max(1, -(-total // PAGE_SIZE))
+            page = min(page, pages)
+            out = ready[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
+        else:
+            _, total = database.query_realizations(limit=0, **args)
+            pages = max(1, -(-total // PAGE_SIZE))
+            page = min(page, pages)
+            rows, _ = database.query_realizations(offset=(page - 1) * PAGE_SIZE, limit=PAGE_SIZE, **args)
+            out = [view(r) for r in rows]
         master = is_master(user)
-        owners = sorted({v["owner_email"] for v in out if v.get("owner_email")}) if master else []
+        owners = database.distinct_owners() if master else []
         return {"entries": out, "worker": mgr.worker_status(), "save_enabled": save_enabled(),
                 "viewer": {"email": user, "is_master": master}, "owners": owners,
+                "page": page, "pages": pages, "total": total, "page_size": PAGE_SIZE,
                 "erp_login": credentials.mode_for(user),
                 "erp_configured": bool(os.getenv("ERP_USERNAME") and os.getenv("ERP_PASSWORD"))
                                   or credentials.mode_for(user)["mode"] != "missing"}
+
+    @router.put("/entries/{entry_id}/cell")
+    def edit_cell(entry_id: int, body: CellEdit, user: Optional[str] = Depends(current_user)):
+        """A user corrects one processed value. The table then shows '(edited)' under it."""
+        rec = database.get_realization(entry_id)
+        if rec is None or not can_access(rec.get("owner_email"), user):
+            raise HTTPException(404, "entry not found")
+        if get_manager().active_for_entry(entry_id):
+            raise HTTPException(409, "A run is in progress for this entry: edit it after the run has finished.")
+        try:
+            database.edit_entry(entry_id, body.field, body.value, user)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True}
 
     @router.get("/credentials/me")
     def my_login(user: Optional[str] = Depends(current_user)):

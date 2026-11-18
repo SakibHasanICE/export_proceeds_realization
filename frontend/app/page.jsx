@@ -7,7 +7,7 @@ import StatusGuide from "../components/StatusGuide";
 import UploadButton from "../components/UploadButton";
 import UserMenu from "../components/UserMenu";
 import { uploadFiles } from "../lib/upload";
-import { api, post } from "../lib/api";
+import { api, post, put } from "../lib/api";
 import { ACTIVE } from "../lib/format";
 
 function skippedShown(n) {
@@ -27,6 +27,9 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("all");
   const [search, setSearch] = useState("");
+  const [dSearch, setDSearch] = useState("");           // the search text the server is asked for (after a short pause)
+  const [page, setPage] = useState(1);                  // 100 entries per page
+  const [pageInfo, setPageInfo] = useState({ pages: 1, total: 0 });
   const [onlyReady, setOnlyReady] = useState(false);
   const [showLines, setShowLines] = useState(false);
   const [expanded, setExpanded] = useState(new Set());
@@ -46,7 +49,14 @@ export default function Page() {
 
   const load = useCallback(async () => {
     try {
-      const d = await api("/erp/entries");
+      const qs = new URLSearchParams({ page: String(page) });
+      if (status !== "all") qs.set("status", status);
+      if (dSearch.trim()) qs.set("search", dSearch.trim());
+      if (ownerFilter !== "all") qs.set("owner", ownerFilter);
+      if (onlyReady) qs.set("only_ready", "true");
+      const d = await api("/erp/entries?" + qs.toString());
+      if (d.page && d.page !== page) setPage(d.page);   // the server moved us (e.g. the last page became empty)
+      setPageInfo({ pages: d.pages || 1, total: d.total || 0 });
       setEntries(d.entries);
       setWorker(d.worker);
       setErpConfigured(d.erp_configured);
@@ -60,7 +70,18 @@ export default function Page() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [page, status, dSearch, ownerFilter, onlyReady]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (search !== dSearch) {
+        setDSearch(search);
+        setPage(1);
+        setSelected(new Set());
+      }
+    }, 350);
+    return () => clearTimeout(t);
+  }, [search, dSearch]);
 
   const anyActive = entries.some((e) => e.last_run && ACTIVE.includes(e.last_run.state));
   useEffect(() => {
@@ -76,18 +97,8 @@ export default function Page() {
     [entries]
   );
 
-  const visible = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return entries.filter((e) => {
-      if (status !== "all" && e.status !== status) return false;
-      if (onlyReady && !e.can_run) return false;
-      if (ownerFilter !== "all" && (e.owner_email || "") !== (ownerFilter === "none" ? "" : ownerFilter)) return false;
-      if (!q) return true;
-      return [e.id, e.bank, e.bill_invoice_no, e.beneficiary, e.buyer, e.lc_sc_no, e.owner_email]
-        .map((x) => String(x || "").toLowerCase())
-        .some((x) => x.includes(q));
-    });
-  }, [entries, status, search, onlyReady, ownerFilter]);
+  // search / status / owner / ready are applied by the server on ALL pages, so what we got is what is shown
+  const visible = entries;
 
   // One column per account number found in the shown documents (value = amount distributed to it)
   const accounts = useMemo(() => {
@@ -195,10 +206,30 @@ export default function Page() {
     if (id) {
       setStatus("all");
       setSearch("");
+      setDSearch("");
+      setPage(1);
       setOwnerFilter("all");
       setHighlightId(id);
       setTimeout(() => setHighlightId(null), 15000);
     }
+  }
+
+  // a user corrects one processed value; the table then shows "(edited)" under it
+  async function editCell(id, field, value) {
+    try {
+      await put(`/erp/entries/${id}/cell`, { field, value });
+      await load();
+      return true;
+    } catch (e) {
+      flash(`Could not save the change: ${e.message}`);
+      return false;
+    }
+  }
+
+  function goPage(p) {
+    setPage(Math.max(1, Math.min(pageInfo.pages, p)));
+    setSelected(new Set());
+    setExpanded(new Set());
   }
 
   function toggle(id) {
@@ -251,19 +282,19 @@ export default function Page() {
 
         <div className="toolbar">
           <input className="input" placeholder="Search bill, bank, beneficiary, buyer…" value={search} onChange={(e) => setSearch(e.target.value)} />
-          <select className="input" value={status} onChange={(e) => setStatus(e.target.value)}>
+          <select className="input" value={status} onChange={(e) => { setStatus(e.target.value); setPage(1); setSelected(new Set()); }}>
             <option value="all">All statuses</option>
             <option value="pending">pending</option>
             <option value="filled">filled</option>
           </select>
           {viewer.is_master && (
-            <select className="input" value={ownerFilter} onChange={(e) => setOwnerFilter(e.target.value)}>
+            <select className="input" value={ownerFilter} onChange={(e) => { setOwnerFilter(e.target.value); setPage(1); setSelected(new Set()); }}>
               <option value="all">All users</option>
               {owners.map((o) => <option key={o} value={o}>{o}</option>)}
               <option value="none">No owner (old data / bank mail)</option>
             </select>
           )}
-          <label className="check"><input type="checkbox" checked={onlyReady} onChange={(e) => setOnlyReady(e.target.checked)} /> only ready to run</label>
+          <label className="check"><input type="checkbox" checked={onlyReady} onChange={(e) => { setOnlyReady(e.target.checked); setPage(1); setSelected(new Set()); }} /> only ready to run</label>
           <label className="check"><input type="checkbox" checked={showLines} onChange={(e) => setShowLines(e.target.checked)} /> show line details</label>
           <span className="spacer" />
           {viewer.email && <ErpLoginButton login={erpLogin} onChange={load} onNotice={flash} />}
@@ -290,6 +321,7 @@ export default function Page() {
             onRun={requestRun}
             saveEnabled={saveEnabled}
             showOwner={viewer.is_master}
+            onEdit={editCell}
             onResolve={resolveSave}
             onOpenRun={(r) => setTracker({ batchId: null, jobId: r.id })}
             selected={selected}
@@ -297,6 +329,13 @@ export default function Page() {
             onSelectAll={toggleSelectAll}
           />
         )}
+        <div className="pager">
+          <button className="btn" disabled={page <= 1} onClick={() => goPage(page - 1)}>‹ Prev</button>
+          <span className="muted">
+            Page {page} of {pageInfo.pages} · {pageInfo.total} entr{pageInfo.total === 1 ? "y" : "ies"}
+          </span>
+          <button className="btn" disabled={page >= pageInfo.pages} onClick={() => goPage(page + 1)}>Next ›</button>
+        </div>
         <div className="spacer-bottom" />
       </div>
 
