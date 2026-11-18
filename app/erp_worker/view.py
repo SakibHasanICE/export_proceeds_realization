@@ -78,6 +78,9 @@ def build_erp_view(rec: dict) -> dict:
     s = lambda rows, k: round(sum(float(r[k] or 0) for r in rows), 2)
 
     blockers: list[str] = []
+    save_state = None            # manual "check the ERP" step removed: a clicked Save counts as saved
+    if save_state:
+        blockers.append("a Save in the ERP may have happened: check the ERP, then say whether it was saved")
     if rec.get("status") == "filled":
         blockers.append("already marked as filled")
     for f, label in (("beneficiary", "Beneficiary"), ("bill_invoice_no", "Bill/Invoice No"),
@@ -123,7 +126,9 @@ def build_erp_view(rec: dict) -> dict:
     if rec.get("needs_review"):
         first = (rec.get("issues") or [None])[0]
         warns.append(f"Check: {first}" if first else "Needs review")
-    if rec.get("status") == "filled":
+    if save_state:
+        remark = {"level": "error", "text": "Save not confirmed: check the ERP"}
+    elif rec.get("status") == "filled":
         remark = {"level": "info", "text": "Saved in the ERP"}
     elif errs:
         remark = {"level": "error", "text": "; ".join(errs[:2])[:90]}
@@ -137,6 +142,8 @@ def build_erp_view(rec: dict) -> dict:
         "id": rec["id"], "bank": rec.get("bank"), "bill_invoice_no": rec.get("bill_invoice_no"),
         "status": rec.get("status"), "needs_review": rec.get("needs_review"),
         "source_file": rec.get("source_file"), "created_at": rec.get("created_at"),
+        "owner_email": rec.get("owner_email"),
+        "save_state": save_state,
         "erp_clicked_at": (rec.get("meta") or {}).get("erp_clicked_at"),
         "erp_clicked_by": (rec.get("meta") or {}).get("erp_clicked_by"),
         "beneficiary": rec.get("beneficiary"), "buyer": rec.get("buyer"), "lc_sc_no": rec.get("lc_sc_no"),

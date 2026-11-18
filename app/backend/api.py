@@ -1,6 +1,7 @@
 """FastAPI backend: review, edit and approve extracted realizations."""
 import hmac
 import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Optional
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 
 from app.common.custom_exception import CustomException
 from app.common.logger import get_logger
-from app.backend.auth import current_user
+from app.backend.auth import can_access, current_user, owner_scope
 from app.backend.erp_api import build_router as build_erp_router
 from app.components import database, pipeline
 from app.config.settings import settings
@@ -77,8 +78,17 @@ def poll_now():
         raise HTTPException(502, str(e))
 
 
+def _mine(rid: int, user: Optional[str]) -> dict:
+    """The record, or 404. Someone else's record is reported as 404 too (its existence is not revealed)."""
+    rec = database.get_realization(rid)
+    if rec is None or not can_access(rec.get("owner_email"), user):
+        raise HTTPException(404, "not found")
+    return rec
+
+
 @router.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), replace: bool = False):
+async def upload_pdf(file: UploadFile = File(...), replace: bool = False,
+                     user: Optional[str] = Depends(current_user)):
     """Manually process a bank advice PDF or an EBL realization sheet (.xlsx)."""
     data = await file.read()
     if len(data) > MAX_UPLOAD:
@@ -90,27 +100,28 @@ async def upload_pdf(file: UploadFile = File(...), replace: bool = False):
     path = settings.staging_dir / f"upload_{uuid.uuid4().hex[:8]}{'.pdf' if is_pdf else '.xlsx'}"
     path.write_bytes(data)
     try:
-        return pipeline.process_file(path, message_id=None, replace=replace)
+        return pipeline.process_file(path, message_id=None, replace=replace, owner_email=user,
+                                     display_name=Path(file.filename or "").name or None)
     except CustomException as e:
         raise HTTPException(500, str(e))
 
 
 @router.get("/realizations")
-def list_realizations(status: Optional[str] = None, needs_review: Optional[bool] = None):
-    return database.list_realizations(status, needs_review)
+def list_realizations(status: Optional[str] = None, needs_review: Optional[bool] = None,
+                      user: Optional[str] = Depends(current_user)):
+    return database.list_realizations(status, needs_review, owner_email=owner_scope(user))
 
 
 @router.get("/realizations/{rid}")
-def get_realization(rid: int):
-    rec = database.get_realization(rid)
-    if rec is None:
-        raise HTTPException(404, "not found")
+def get_realization(rid: int, user: Optional[str] = Depends(current_user)):
+    rec = _mine(rid, user)
     rec["missing_for_erp"] = database.missing_for_erp(rec)
     return rec
 
 
 @router.put("/realizations/{rid}")
-def update_realization(rid: int, body: RealizationUpdate):
+def update_realization(rid: int, body: RealizationUpdate, user: Optional[str] = Depends(current_user)):
+    _mine(rid, user)
     fields = body.model_dump(exclude_unset=True)
     dists = fields.pop("distributions", None)
     deds = fields.pop("deductions", None)
@@ -125,7 +136,8 @@ def update_realization(rid: int, body: RealizationUpdate):
 
 
 @router.post("/realizations/{rid}/approve")
-def approve(rid: int):
+def approve(rid: int, user: Optional[str] = Depends(current_user)):
+    _mine(rid, user)
     try:
         rec = database.approve_realization(rid)
     except ValueError as e:
@@ -140,8 +152,9 @@ class FilledIn(BaseModel):
 
 
 @router.post("/realizations/{rid}/filled")
-def filled(rid: int, body: Optional[FilledIn] = None):
+def filled(rid: int, body: Optional[FilledIn] = None, user: Optional[str] = Depends(current_user)):
     """RPA callback: the robot entered this approved entry into the ERP (status approved -> filled)."""
+    _mine(rid, user)
     try:
         rec = database.mark_filled(rid, body.note if body else None)
     except ValueError as e:
@@ -152,17 +165,15 @@ def filled(rid: int, body: Optional[FilledIn] = None):
 
 
 @router.get("/realizations/{rid}/erp")
-def erp_form(rid: int):
+def erp_form(rid: int, user: Optional[str] = Depends(current_user)):
     """The record shaped like the ERP form (for the future auto-fill step)."""
-    rec = database.get_realization(rid)
-    if rec is None:
-        raise HTTPException(404, "not found")
+    rec = _mine(rid, user)
     return database.erp_payload(rec)
 
 
 @router.get("/other-documents")
-def other_documents():
-    return database.list_other_documents()
+def other_documents(user: Optional[str] = Depends(current_user)):
+    return database.list_other_documents(owner_email=owner_scope(user))
 
 
 app.include_router(router)

@@ -1,4 +1,7 @@
-"""ERP automation (Playwright): fills the Export Proceeds Realization form. It NEVER clicks Save.
+"""ERP automation (Playwright): fills the Export Proceeds Realization form.
+
+It clicks Save only when ERP_SAVE_ENABLED=true in .env AND every value read back from the ERP matches the database
+AND the database gate allows it. Otherwise it fills, verifies, takes a screenshot and closes without saving.
 
 Used by the web UI through app/erp_worker/runner.py (run_entry), or from the command line:
     docker compose exec app python -m app.erp_worker.erp_data 18
@@ -7,18 +10,23 @@ Needs in .env:
     ERP_URL, ERP_USERNAME, ERP_PASSWORD
 Set by docker-compose:
     ERP_HEADLESS, ERP_STATE_FILE, ERP_SHOT_DIR
+Saving (all optional; saving is OFF unless ERP_SAVE_ENABLED=true):
+    ERP_SAVE_ENABLED, ERP_SAVE_SELECTOR (CSS for the Save button), ERP_SAVE_WAIT (seconds to wait for the ERP's answer),
+    ERP_SAVE_SUCCESS_REGEX / ERP_SAVE_FAIL_REGEX (how to read the ERP's alert after Save)
 """
 import builtins
 import contextlib
 import difflib
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
+from app.erp_worker.save_hooks import SaveRefused
 from playwright.sync_api import (
     BrowserContext,
     Page,
@@ -33,9 +41,32 @@ ERP_USERNAME = os.getenv("ERP_USERNAME")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD")
 HEADLESS = os.getenv("ERP_HEADLESS", "true").lower() == "true"
 STATE_FILE = Path(os.getenv("ERP_STATE_FILE", "erp_state.json"))
+
+# The ERP login of the run in progress (set by run_entry): the user's own, or the shared one from .env.
+_run_login = threading.local()
+
+
+def _creds() -> tuple[str | None, str | None, Path, bool]:
+    """(username, password, session file, is_personal)"""
+    c = getattr(_run_login, "v", None)
+    if c:
+        return c["username"], c["password"], Path(c["state_file"]), True
+    return ERP_USERNAME, ERP_PASSWORD, STATE_FILE, False
 SHOT_DIR = Path(os.getenv("ERP_SHOT_DIR", "erp_screens"))
 RUN_TIMEOUT_S = int(os.getenv("ERP_RUN_TIMEOUT", "300"))          # one attempt may not take longer than this
 DISCOVER_HEADS = os.getenv("ERP_DISCOVER_HEADS", "false").lower() == "true"   # debug: list the ERP's heads
+SAVE_WAIT_S = int(os.getenv("ERP_SAVE_WAIT", "20"))               # how long to wait for the ERP's answer to Save
+# How the ERP's alert after Save is read. NEG wins; a success word without any failure word means saved;
+# a failure word without a success word means refused; anything else is "unconfirmed" (a person must look).
+SAVE_NEG_RE = re.compile(r"\bnot\s+(been\s+)?saved\b|unsuccess|\bfail|could\s?n[o']t|unable", re.I)
+SAVE_OK_RE = re.compile(os.getenv("ERP_SAVE_SUCCESS_REGEX", r"\bsaved\b|success"), re.I)
+SAVE_FAIL_RE = re.compile(os.getenv("ERP_SAVE_FAIL_REGEX",
+                                    r"error|cannot|can't|invalid|required|mandatory|duplicate|already|exceed|"
+                                    r"not match|mismatch|please|select|must"), re.I)
+
+
+def save_enabled() -> bool:
+    return os.getenv("ERP_SAVE_ENABLED", "false").strip().lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +83,8 @@ STEPS = [
     ("deductions", "Fill Deductions at Source"),
     ("distributions", "Fill Distributions"),
     ("verify", "Verify every filled value"),
-    ("screenshot", "Take the final screenshot (nothing is saved)"),
+    ("save", "Save in the ERP (only when saving is switched on)"),
+    ("screenshot", "Take the final screenshot"),
 ]
 
 
@@ -168,7 +200,8 @@ def is_logged_in(page: Page) -> bool:
 
 
 def login(page: Page) -> None:
-    if not ERP_USERNAME or not ERP_PASSWORD:
+    username, password, _state, personal = _creds()
+    if not username or not password:
         raise ErpError("CONFIG", "ERP_USERNAME / ERP_PASSWORD are not set.",
                        "Add them to the .env file next to docker-compose.yml, then run: docker compose up -d")
 
@@ -187,8 +220,8 @@ def login(page: Page) -> None:
             'input[type="password"]',
         ])
 
-        user_box.fill(ERP_USERNAME)
-        pass_box.fill(ERP_PASSWORD)
+        user_box.fill(username)
+        pass_box.fill(password)
 
         login_btn = _first_visible(page, [
             'button:has-text("Login")',
@@ -200,6 +233,8 @@ def login(page: Page) -> None:
         page.wait_for_load_state("networkidle")
         if not is_logged_in(page):
             raise ErpError("LOGIN_FAILED", "The ERP did not accept the login.",
+                           "Your saved ERP username or password is not accepted (did the ERP password change?). "
+                           "Click 'My ERP login' at the top of the page and save it again." if personal else
                            "Check ERP_USERNAME / ERP_PASSWORD in .env (has the ERP password changed?).")
     except ErpError:
         screenshot(page, "login_failed")
@@ -220,8 +255,9 @@ def get_logged_in_context(p) -> tuple[BrowserContext, Page]:
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
 
-    if STATE_FILE.exists():
-        context = browser.new_context(storage_state=str(STATE_FILE), viewport={"width": 1280, "height": 1000})
+    state_file = _creds()[2]
+    if state_file.exists():
+        context = browser.new_context(storage_state=str(state_file), viewport={"width": 1280, "height": 1000})
         page = context.new_page()
         page.goto(ERP_URL.replace("login.php", "index.php"), wait_until="domcontentloaded")
         if is_logged_in(page):
@@ -232,8 +268,8 @@ def get_logged_in_context(p) -> tuple[BrowserContext, Page]:
     context = browser.new_context(viewport={"width": 1280, "height": 1000})
     page = context.new_page()
     login(page)
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(STATE_FILE))
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    context.storage_state(path=str(state_file))
     say("Logged in and saved session")
     return context, page
 
@@ -1130,6 +1166,9 @@ _TITLES = {
     "BROWSER_CLOSED": "The browser stopped unexpectedly",
     "ERP_UNREACHABLE": "ERP cannot be reached",
     "FIELD_LOCKED": "An ERP box is locked",
+    "SAVE_BUTTON_NOT_FOUND": "Save button not found",
+    "SAVE_BUTTON_AMBIGUOUS": "More than one Save button",
+    "SAVE_BUTTON_DISABLED": "Save button is disabled",
     "UNEXPECTED": "Unexpected problem",
 }
 _RETRYABLE = {"TIMEOUT", "BROWSER_CLOSED", "ERP_UNREACHABLE", "FORM_NOT_LOADED", "DIALOG_NOT_OPEN",
@@ -1180,6 +1219,193 @@ def validate_payload(payload: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Saving
+# ---------------------------------------------------------------------------
+def classify_save_messages(msgs: list[str]) -> str:
+    """Read the ERP's alerts shown after Save: saved | rejected | unconfirmed."""
+    if any(SAVE_NEG_RE.search(m) for m in msgs):
+        return "rejected"
+    ok = any(SAVE_OK_RE.search(m) for m in msgs)
+    bad = any(SAVE_FAIL_RE.search(m) for m in msgs)
+    if bad and not ok:
+        return "rejected"
+    return "saved"                # Save was clicked and the ERP did not refuse: that is a save (no manual check)
+
+
+_FIND_SAVE_JS = r"""
+() => {
+  document.querySelectorAll('[data-rb-save]').forEach(e => e.removeAttribute('data-rb-save'));
+  const norm = (t) => (t || '').replace(/[^\p{L}\p{N}&]+/gu, ' ').trim().toLowerCase();
+  const visible = (e) => {
+    const r = e.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    const cs = getComputedStyle(e);
+    return cs.visibility !== 'hidden' && cs.display !== 'none';
+  };
+  const label = (e) => {
+    if (e.tagName === 'INPUT') return norm(e.value || e.title || e.alt);
+    return norm(e.innerText || e.textContent);
+  };
+  const all = Array.from(document.querySelectorAll(
+    'button, input[type=button], input[type=submit], input[type=image], a, span, div, td, label, [role=button], [onclick]'));
+  const hits = [];
+  for (const e of all) {
+    if (label(e) !== 'save' || !visible(e)) continue;
+    // the real clickable thing: the closest button-like ancestor, else the element itself
+    const click = e.closest('button, input, a, [role=button], [onclick]') || e;
+    if (!hits.includes(click)) hits.push(click);
+  }
+  // when a wrapper and its inner button both matched, keep the innermost one only
+  const inner = hits.filter(h => !hits.some(o => o !== h && h.contains(o)));
+  const out = inner.map((e, i) => {
+    e.setAttribute('data-rb-save', String(i));
+    const cls = (e.className || '').toString();
+    return {i, tag: e.tagName.toLowerCase(), id: e.id || '', cls: cls.slice(0, 60),
+            disabled: !!e.disabled || e.getAttribute('aria-disabled') === 'true' || /\bdisabled\b/i.test(cls),
+            html: e.outerHTML.slice(0, 200)};
+  });
+  return out;
+}
+"""
+
+_BUTTONS_DUMP_JS = r"""
+() => Array.from(document.querySelectorAll('button, input[type=button], input[type=submit], input[type=image], a, [role=button], [onclick]'))
+  .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+  .map(e => ((e.tagName === 'INPUT' ? e.value : e.innerText) || e.title || '').trim().slice(0, 30) + ' <' + e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + '>')
+  .filter(t => t.length > 0).slice(0, 40)
+"""
+
+
+def _find_save_button(ctx):
+    """The one visible, enabled Save button of the form (any tag: button, input, a, span, div + icon).
+
+    Looks in the form's frame first, then in every other frame of the page. Anything unclear stops the run
+    before anything is clicked."""
+    custom = os.getenv("ERP_SAVE_SELECTOR", "").strip()
+    page = ctx.page
+    frames = [ctx] + [f for f in page.frames if f is not ctx]
+    found: list[tuple] = []                 # (frame, locator, info)
+    for fr in frames:
+        try:
+            if custom:
+                loc = fr.locator(custom)
+                for i in range(loc.count()):
+                    if loc.nth(i).is_visible():
+                        found.append((fr, loc.nth(i), {"disabled": not loc.nth(i).is_enabled(), "html": custom}))
+            else:
+                infos = fr.evaluate(_FIND_SAVE_JS)
+                for inf in infos:
+                    found.append((fr, fr.locator(f'[data-rb-save="{inf["i"]}"]'), inf))
+        except Exception:
+            continue
+    if not found:
+        seen = []
+        for fr in frames:
+            with contextlib.suppress(Exception):
+                seen += fr.evaluate(_BUTTONS_DUMP_JS)
+        say(f"Save button not found. Buttons the robot can see: {seen}", "warn")
+        raise ErpError("SAVE_BUTTON_NOT_FOUND", "The robot could not find the Save button on the ERP form.",
+                       "Nothing was clicked. Set ERP_SAVE_SELECTOR in .env to the Save button's CSS selector.",
+                       {"buttons_seen": seen})
+    if len(found) > 1:
+        say("Several Save-like buttons: " + " | ".join(f[2].get("html", "")[:120] for f in found), "warn")
+        raise ErpError("SAVE_BUTTON_AMBIGUOUS", f"Found {len(found)} buttons that look like Save.",
+                       "Nothing was clicked. Set ERP_SAVE_SELECTOR in .env to the exact Save button.")
+    fr, loc, inf = found[0]
+    say(f"Save button found: {inf.get('html', '')[:120]}")
+    if inf.get("disabled"):
+        raise ErpError("SAVE_BUTTON_DISABLED", "The ERP's Save button is disabled.",
+                       "Nothing was clicked. The ERP may already hold this entry, or the form is in update mode.")
+    return loc
+
+
+def _button_states(ctx) -> list[dict]:
+    try:
+        return ctx.evaluate("""() => [...document.querySelectorAll('input[type=button],input[type=submit],button,a,[role=button]')]
+            .map(b => ({text: (b.value || b.innerText || '').trim(), id: b.id, disabled: !!b.disabled}))
+            .filter(b => b.text)""")
+    except Exception:
+        return []
+
+
+def _save_entry(ctx, page: Page, ver: dict, hooks, ctl: dict, phase: dict, save_msgs: list[str]) -> dict:
+    """Click Save when everything allows it. Returns {'state': ...}. Before the click, problems stop the run with
+    nothing saved. From the click on, this function NEVER raises: whatever happens, the entry may be saved,
+    so the outcome is recorded and the run is never repeated."""
+    if hooks is None:
+        return {"state": "skipped", "reason": "no database connection for saving"}
+    if not ver["ok"]:
+        c = ver["counts"]
+        return {"state": "skipped",
+                "reason": f"{c['error'] + c['warn']} value(s) need checking, so the robot did not save"}
+    try:
+        hooks.gate()
+    except SaveRefused as e:
+        return {"state": "skipped", "reason": str(e)}
+    btn = _find_save_button(ctx)
+    if REPORT.cancelled():
+        raise ErpCancelled()
+
+    # ------------------------------------------------ point of no return
+    hooks.before_click()                  # database: "save in progress" (blocks any second run of this entry)
+    ctl["clicked"] = True
+    phase["save"] = True
+    clicked_at = datetime.now().isoformat(timespec="seconds")
+    before_buttons = _button_states(ctx)
+    info: dict = {"state": "unconfirmed", "clicked_at": clicked_at, "messages": save_msgs}
+    try:
+        say("Clicking Save in the ERP", "warn")
+        btn.click()
+        with contextlib.suppress(Exception):
+            page.wait_for_load_state("networkidle", timeout=5000)
+        deadline = time.time() + SAVE_WAIT_S
+        while time.time() < deadline:
+            page.wait_for_timeout(500)
+            if save_msgs:                  # an answer arrived; give the ERP a moment for a possible second alert
+                page.wait_for_timeout(1500)
+                break
+        info["state"] = classify_save_messages(save_msgs)
+        info["no_message"] = not save_msgs
+        info["buttons_before"], info["buttons_after"] = before_buttons, _button_states(ctx)
+        with contextlib.suppress(Exception):
+            info["form_after"] = read_form_values(ctx)
+        with contextlib.suppress(Exception):
+            screenshot(page, "after_save")
+        for m in save_msgs:
+            say(f"  [ERP answer after Save] {m!r}")
+    except Exception as e:                # the click happened; we cannot know more than this
+        info["error"] = str(e)[:300]
+        say(f"Problem after clicking Save: {e}", "error")
+    finally:
+        phase["save"] = False
+    info["messages"] = list(save_msgs)
+    if info["state"] == "unconfirmed":        # an error right after the click: Save was clicked, so it counts as saved
+        info["state"] = "saved"
+    note = {"saved": ("ERP answered: " + " | ".join(save_msgs)[:200]) if save_msgs
+                     else "Save clicked, the ERP showed no error",
+            "rejected": "ERP answered: " + " | ".join(save_msgs)[:200],
+            "unconfirmed": ("no clear answer from the ERP: " + " | ".join(save_msgs)[:200]) if save_msgs
+                           else "no answer from the ERP after Save"}[info["state"]]
+    info["note"] = note
+    try:
+        hooks.after(info["state"], note)
+    except Exception as e:                # the database keeps "in progress", which still blocks a second save
+        say(f"Could not record the save outcome in the database: {e}. The entry may be blocked until the database is fixed.", "error")
+        info["db_error"] = str(e)[:200]
+    ctl["save"] = info
+    return info
+
+
+def _outcome(ver: dict, save: dict) -> str:
+    s = save.get("state")
+    if s == "saved":
+        return "succeeded"
+    if s in ("rejected", "unconfirmed"):
+        return "attention"
+    return "succeeded" if ver["ok"] else "attention"
+
+
+# ---------------------------------------------------------------------------
 # One full run for one entry
 # ---------------------------------------------------------------------------
 def _checkpoint(t0: float) -> None:
@@ -1205,8 +1431,10 @@ def _step(key: str, msg: str = ""):
     REPORT.step(key, "done", note.get("msg", ""))
 
 
-def _attempt(payload: dict, t0: float) -> dict:
+def _attempt(payload: dict, t0: float, ctl: dict, hooks) -> dict:
     alerts: list[str] = []
+    save_msgs: list[str] = []            # the ERP's alerts while (and only while) the Save step is running
+    phase = {"save": False}
     target = payload["Bill/Invoice No"]
     with sync_playwright() as p:
         with _step("browser", "Starting a headless browser and logging in to the ERP"):
@@ -1215,7 +1443,16 @@ def _attempt(payload: dict, t0: float) -> dict:
             def on_dialog(d):
                 alerts.append(d.message)
                 say(f"  [browser alert] {d.message!r}")
-                d.accept()
+                if not phase["save"]:
+                    d.accept()
+                elif d.type == "alert":                       # information from the ERP: read it, then close it
+                    save_msgs.append(d.message)
+                    d.accept()
+                elif d.type == "confirm" and re.search(r"\bsave\b", d.message, re.I) and not SAVE_NEG_RE.search(d.message):
+                    d.accept()                                # "Do you want to save?" is expected
+                else:
+                    say(f"The ERP asked an unexpected question while saving, so it was declined: {d.message!r}", "warn")
+                    d.dismiss()
 
             page.on("dialog", on_dialog)
 
@@ -1264,9 +1501,33 @@ def _attempt(payload: dict, t0: float) -> dict:
                             + (f" ({chk['note']})" if chk["note"] else ""),
                             "error" if chk["status"] == "error" else "warn")
 
-            with _step("screenshot", "Saving a full-page screenshot of the filled form") as n:
+            save_res: dict = {"state": "off"}
+            if not save_enabled():
+                REPORT.step("save", "skipped", "Saving is switched off (ERP_SAVE_ENABLED is not true): nothing is saved")
+                try:                       # harmless check, so the Save button can be tested before saving is switched on
+                    _find_save_button(ctx)
+                    say("Check only: the Save button was found on the form. It was NOT clicked.")
+                except ErpError as e:
+                    say(f"Check only: {e.message} {e.hint}", "warn")
+                except Exception:
+                    pass
+            else:
+                with _step("save", "Checking everything, then clicking Save in the ERP") as n:
+                    save_res = _save_entry(ctx, page, ver, hooks, ctl, phase, save_msgs)
+                    n["msg"] = {
+                        "saved": "Saved. " + save_res.get("note", ""),
+                        "rejected": "The ERP refused to save, nothing was saved. " + save_res.get("note", ""),
+                        "unconfirmed": "Save was clicked but the ERP did not clearly confirm it. CHECK THE ERP. "
+                                       + save_res.get("note", ""),
+                        "skipped": "Not saved: " + save_res.get("reason", ""),
+                    }.get(save_res["state"], "")
+
+            with _step("screenshot", "Saving a full-page screenshot of the form") as n:
                 shot = screenshot(page, "final_form")
-                n["msg"] = "Nothing was saved in the ERP: the browser closes without clicking Save"
+                n["msg"] = {"saved": "The entry is saved in the ERP",
+                            "rejected": "The ERP refused to save: nothing was saved",
+                            "unconfirmed": "The ERP did not clearly confirm the save: check it before running again",
+                            }.get(save_res["state"], "Nothing was saved in the ERP: the browser closes without clicking Save")
         except BaseException:
             with contextlib.suppress(Exception):
                 screenshot(page, "error")
@@ -1279,20 +1540,43 @@ def _attempt(payload: dict, t0: float) -> dict:
     if heads_alerts and all((r.get("Account Head") for r in (payload.get("Distributions") or []))):
         say(f"The ERP warned {len(heads_alerts)} time(s): {heads_alerts[0]!r} although the heads were set.", "warn")
     return {
-        "outcome": "succeeded" if ver["ok"] else "attention",
+        "outcome": _outcome(ver, save_res),
         "verification": ver,
         "erp_values": header,
         "alerts": alerts,
+        "save": save_res,
     }
 
 
-def run_entry(payload: dict, reporter: Reporter | None = None, max_attempts: int = 2) -> dict:
-    """Fill the ERP form for one entry (never saves). Always returns a result dict; never raises.
+def run_entry(payload: dict, reporter: Reporter | None = None, max_attempts: int = 2, hooks=None,
+              login: dict | None = None) -> dict:
+    """login = the pressing user's own ERP login {'username','password','state_file'}; None = the shared .env login."""
+    _run_login.v = login
+    try:
+        return _run_entry(payload, reporter, max_attempts, hooks)
+    finally:
+        _run_login.v = None            # the password does not stay in memory between runs
 
-    outcome: succeeded | attention (filled, but something differs) | failed | cancelled
+
+def _run_entry(payload: dict, reporter: Reporter | None = None, max_attempts: int = 2, hooks=None) -> dict:
+    """Fill the ERP form for one entry, and save it when saving is switched on. Always returns a result dict.
+
+    outcome: succeeded | attention (filled but something differs, or the save was refused / not confirmed)
+             | failed | cancelled
+    result["save"]["state"]: off | skipped | saved | rejected | unconfirmed
+    Once Save has been clicked the run is NEVER repeated (no retry), whatever happens afterwards.
     """
     set_reporter(reporter)
     started = time.time()
+    ctl: dict = {"clicked": False}
+
+    def after_click(exc: BaseException | None) -> dict:
+        """Something went wrong after Save was clicked: report what is known and never retry."""
+        save = ctl.get("save") or {"state": "unconfirmed", "note": "the run stopped right after Save was clicked"}
+        if exc is not None:
+            say(f"The run stopped after Save was clicked ({exc}). Check the ERP before running this entry again.", "error")
+        return {"outcome": "attention" if save["state"] != "saved" else "succeeded", "save": save,
+                "verification": None, "alerts": []}
 
     def done(res: dict, attempts: int) -> dict:
         res["attempts"] = attempts
@@ -1317,17 +1601,21 @@ def run_entry(payload: dict, reporter: Reporter | None = None, max_attempts: int
     for attempt in range(1, max_attempts + 1):
         try:
             say(f"Run attempt {attempt} of {max_attempts}" if attempt > 1 else "Starting the ERP run")
-            return done(_attempt(payload, time.time()), attempt)
-        except ErpCancelled:
+            return done(_attempt(payload, time.time(), ctl, hooks), attempt)
+        except ErpCancelled as e:
+            if ctl["clicked"]:
+                return done(after_click(e), attempt)
             say("Cancelled by the user. Nothing was saved in the ERP.", "warn")
             return done({"outcome": "cancelled"}, attempt)
         except Exception as e:
+            if ctl["clicked"]:
+                return done(after_click(e), attempt)
             err = last_err = explain(e)
             say(f"{err['title']}: {err['message']}", "error")
             if err["retryable"] and attempt < max_attempts:
                 say("This looks temporary. Trying once more with a fresh browser session.", "warn")
                 with contextlib.suppress(Exception):
-                    STATE_FILE.unlink()      # drop a possibly stale saved login
+                    _creds()[2].unlink()      # drop a possibly stale saved login
                 REPORT.reset_steps()
                 time.sleep(3)
                 continue
@@ -1348,5 +1636,6 @@ if __name__ == "__main__":
     rec = database.get_realization(rid)
     if not rec:
         raise SystemExit(f"Entry {rid} not found in the database")
-    result = run_entry(build_run_payload(rec))
+    from app.erp_worker.save_hooks import DbSaveHooks
+    result = run_entry(build_run_payload(rec), hooks=DbSaveHooks(rid, "command-line"))
     builtins.print(json.dumps({k: v for k, v in result.items() if k != "erp_values"}, indent=2, default=str)[:4000])

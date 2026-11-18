@@ -218,22 +218,43 @@ function JobView({ jobId, onFinished, onRetry, onNotice }) {
         </div>
         <div className="row-gap">
           {active && <button className="btn" onClick={cancel}>Cancel</button>}
-          {FINAL.includes(job.state) && job.state !== "succeeded" && (
+          {FINAL.includes(job.state) && job.state !== "succeeded" && !(res.save && res.save.state === "unconfirmed") && !job.save_clicked && (
             <button className="btn btn-primary" onClick={() => onRetry(job.entry_id)}>Retry</button>
           )}
         </div>
       </div>
 
       <div className="banner">
-        TEST MODE — the robot fills the form, takes a screenshot and closes the browser. It never clicks Save.
+        {res.save && res.save.state === "off"
+          ? "TEST MODE — the robot fills the form, takes a screenshot and closes the browser. It never clicks Save."
+          : "The robot fills the form and checks every value. When saving is switched on and everything matches, it clicks Save; otherwise nothing is saved."}
       </div>
       {error && <div className="banner banner-warn">Lost contact with the backend ({error}). Retrying…</div>}
 
-      {job.state === "succeeded" && (
-        <div className="card card-ok"><b>✓ Filled and verified.</b> Every value in the ERP form matches the database. Nothing was saved.</div>
-      )}
-      {job.state === "attention" && (
-        <div className="card card-warn"><b>⚠ Filled, but check the highlighted values below</b> before anyone saves this in the ERP. Nothing was saved.</div>
+      {(() => {
+        const sv = res.save && res.save.state;
+        const said = ((res.save && res.save.messages) || []).join(" | ");
+        if (sv === "saved")
+          return <div className="card card-ok"><b>✓ Saved in the ERP.</b> The entry is now marked as saved.{said && ` The ERP said: ${said}`}</div>;
+        if (sv === "unconfirmed")
+          return (
+            <div className="card card-fail">
+              <b>⚠ Save was clicked, but the ERP did not clearly confirm it. Check the ERP.</b> Then answer “It was saved” or
+              “Not saved” on the row in the table. Do not run this entry again before that.{said && ` The ERP said: ${said}`}
+            </div>
+          );
+        if (sv === "rejected")
+          return <div className="card card-fail"><b>The ERP refused to save.</b> Nothing was saved.{said && ` The ERP said: ${said}`}</div>;
+        if (sv === "skipped")
+          return <div className="card card-warn"><b>Filled, but not saved:</b> {res.save.reason}. Nothing was saved.</div>;
+        if (job.state === "succeeded")
+          return <div className="card card-ok"><b>✓ Filled and verified.</b> Every value in the ERP form matches the database. Nothing was saved.</div>;
+        if (job.state === "attention")
+          return <div className="card card-warn"><b>⚠ Filled, but check the highlighted values below</b> before anyone saves this in the ERP. Nothing was saved.</div>;
+        return null;
+      })()}
+      {job.save_clicked && !res.save && (
+        <div className="card card-fail"><b>⚠ The run stopped after Save was clicked.</b> Check the ERP before running this entry again.</div>
       )}
       {job.error && <ErrorCard error={job.error} shots={job.shots} />}
 
@@ -288,7 +309,7 @@ function BatchView({ batchId, jobId, onSelect, onFinished }) {
   if (!batch) return null;
   const pct = batch.total ? Math.round((batch.done / batch.total) * 100) : 0;
   async function cancelAll() {
-    if (window.confirm("Cancel the runs that have not finished yet? Nothing is saved either way.")) {
+    if (window.confirm("Cancel the runs that have not finished yet? A run that has already clicked Save cannot be undone.")) {
       await post(`/erp/batches/${batchId}/cancel`).catch(() => {});
     }
   }

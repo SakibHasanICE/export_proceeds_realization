@@ -11,3 +11,4 @@ pypdf
 pytest
 openpyxl
 playwright
+cryptography

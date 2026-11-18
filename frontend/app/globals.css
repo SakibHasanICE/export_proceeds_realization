@@ -48,10 +48,8 @@ table.main th { position: sticky; top: 0; background: #eef1f6; color: var(--mute
 table.main th.num { text-align: right; }
 table.main tbody tr:hover > td { background: #f3f6fb; }
 table.main tbody tr:not(.detail-row) { cursor: pointer; }
-/* clicked row: stays tinted (must stay below the hover rule so it wins when hovered too) */
-table.main tbody tr.row-checked > td { background: #e8f1ff; }   /* ticked for "Proceed selected" */
-table.main tbody tr.row-selected > td { background: #fff5cc; }
-table.main tbody tr.row-selected > td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
+/* selected row (checkbox or a click anywhere on it): grey. Must stay below the hover rule so it wins when hovered too */
+table.main tbody tr.row-selected > td { background: #e3e6ec; }
 .row-active > td { background: #e6f0ff !important; }
 .stick-l { position: sticky; left: 0; background: var(--panel); z-index: 1; width: 62px; min-width: 62px; }
 .stick-r { position: sticky; right: 0; background: var(--panel); z-index: 1; box-shadow: -8px 0 8px -8px rgba(0, 0, 0, .18); }
@@ -188,3 +186,10 @@ td.remark { white-space: normal !important; min-width: 170px; max-width: 300px; 
   padding: 28px; display: flex; flex-direction: column; gap: 14px; }
 .login-card h1 { margin: 0; font-size: 22px; }
 .login-card p { margin: 0; }
+
+/* live mode (the robot saves) */
+.banner-live { background: #fff1e5; border-color: #f0b27a; color: #8a3b00; }
+.resolve { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+
+.modal-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, .45); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.modal { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; width: min(440px, 92vw); box-shadow: 0 12px 40px rgba(0, 0, 0, .25); }

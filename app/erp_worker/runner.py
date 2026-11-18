@@ -1,7 +1,8 @@
 """Background job queue for the ERP robot: one run at a time, every step tracked and saved.
 
 The web UI never talks to Playwright directly: it submits entry ids here, then polls the job for
-steps, log lines, screenshots and the final verification.  Nothing in here ever saves in the ERP.
+steps, log lines, screenshots and the final verification.  Saving in the ERP happens inside erp_data, and
+only when ERP_SAVE_ENABLED=true; this module just records what happened.
 """
 import json
 import os
@@ -37,7 +38,8 @@ def _fallback_steps() -> list[dict]:
             ("open_form", "Open Export Proceeds Realization"), ("header", "Select the Beneficiary"),
             ("bill", "Find and pick the Bill / Invoice"), ("received", "Set the Received Date"),
             ("deductions", "Fill Deductions at Source"), ("distributions", "Fill Distributions"),
-            ("verify", "Verify every filled value"), ("screenshot", "Take the final screenshot (nothing is saved)")]
+            ("verify", "Verify every filled value"), ("save", "Save in the ERP (only when saving is switched on)"),
+            ("screenshot", "Take the final screenshot")]
     return [{"key": k, "label": lbl, "status": "pending", "message": "", "started_at": None, "finished_at": None}
             for k, lbl in keys]
 
@@ -65,8 +67,30 @@ class JobReporter:
         self.mgr._reset_steps(self.job)
 
 
+class _TrackedHooks:
+    """Wraps the database hooks so the job remembers that Save was really clicked."""
+
+    def __init__(self, inner, job: dict):
+        self.inner, self.job = inner, job
+
+    def gate(self):
+        return self.inner.gate()
+
+    def before_click(self):
+        self.inner.before_click()
+        self.job["save_clicked"] = True
+
+    def after(self, state: str, note: str = ""):
+        return self.inner.after(state, note)
+
+
 class RunManager:
-    def __init__(self, run_dir: Path, loader: Callable[[int], dict], run_func: Optional[Callable] = None):
+    def __init__(self, run_dir: Path, loader: Callable[[int], dict], run_func: Optional[Callable] = None,
+                 hooks_factory: Optional[Callable[[int, Optional[str]], object]] = None,
+                 credential_provider: Optional[Callable[[Optional[str]], Optional[dict]]] = None):
+        # credential_provider(user email) -> that user's ERP login dict, None (= shared .env login), or raises
+        self.credential_provider = credential_provider
+        self.hooks_factory = hooks_factory    # (entry_id, user) -> database hooks used around the ERP's Save button
         self.run_dir = Path(run_dir)
         self.loader = loader              # entry id -> payload (read fresh from the database at run time)
         self.run_func = run_func          # run_func(payload, reporter) -> result dict; default: erp_data.run_entry
@@ -100,10 +124,12 @@ class RunManager:
             if job.get("state") in ACTIVE:           # the app restarted while this one was running
                 job["state"] = "failed"
                 job["finished_at"] = _now()
+                clicked = bool(job.get("save_clicked"))
                 job["error"] = {"code": "INTERRUPTED", "title": "Run interrupted",
                                 "message": "The application restarted while this run was in progress.",
-                                "hint": "Nothing was saved in the ERP. Run the entry again.", "retryable": True,
-                                "details": {}}
+                                "hint": ("Save had already been clicked: CHECK THE ERP before running this entry again."
+                                         if clicked else "Nothing was saved in the ERP. Run the entry again."),
+                                "retryable": not clicked, "details": {}}
                 for st in job.get("steps", []):
                     if st["status"] in ("running", "pending"):
                         st["status"] = "skipped"
@@ -171,7 +197,8 @@ class RunManager:
                     continue
                 job = {
                     "id": uuid.uuid4().hex[:10], "batch_id": batch_id, "entry_id": e["entry_id"],
-                    "bill_no": e.get("bill_no"), "bank": e.get("bank"), "state": "queued",
+                    "bill_no": e.get("bill_no"), "bank": e.get("bank"), "requested_by": e.get("requested_by"),
+                    "save_clicked": False, "state": "queued",
                     "created_at": _now(), "started_at": None, "finished_at": None, "current_step": None,
                     "steps": _fallback_steps(), "events": [], "event_count": 0, "shots": [],
                     "result": None, "error": None, "attempts": 0, "cancel_requested": False,
@@ -202,6 +229,19 @@ class RunManager:
     def _remark(job: dict) -> Optional[dict]:
         """Very short reason shown in the table's Remarks column (only for problems / uncertainty)."""
         st = job.get("state")
+        save = (job.get("result") or {}).get("save") or {}
+        ss = save.get("state")
+        if ss == "saved":
+            return {"level": "info", "text": "Saved in the ERP"}
+        if ss == "unconfirmed":
+            return {"level": "error", "text": "Save not confirmed: check the ERP"}
+        if ss == "rejected":
+            said = " | ".join(save.get("messages") or [])
+            return {"level": "error", "text": ("ERP refused to save: " + said if said else "ERP refused to save")[:90]}
+        if st in ("failed", "cancelled") and job.get("save_clicked"):
+            return {"level": "error", "text": "Stopped after Save: check the ERP"}
+        if ss == "skipped" and save.get("reason"):
+            return {"level": "warn", "text": ("Not saved: " + save["reason"])[:90]}
         if st == "failed":
             e = job.get("error") or {}
             text = e.get("title") or "Failed"
@@ -231,7 +271,8 @@ class RunManager:
                 "created_at": job["created_at"], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"),
                 "current_step": job.get("current_step"), "current_label": step["label"] if step else None,
                 "error": ({"code": job["error"].get("code"), "title": job["error"].get("title")} if job.get("error") else None),
-                "counts": counts, "attempts": job.get("attempts", 0), "remark": RunManager._remark(job)}
+                "counts": counts, "attempts": job.get("attempts", 0), "remark": RunManager._remark(job),
+                "save_state": (res.get("save") or {}).get("state"), "save_clicked": bool(job.get("save_clicked"))}
 
     def latest_by_entry(self) -> dict[int, dict]:
         with self.lock:
@@ -297,11 +338,23 @@ class RunManager:
             for st in job["steps"]:
                 if st["status"] in ("pending", "running"):
                     st["status"] = "skipped"
-            label = {"succeeded": "Finished: the ERP form is filled. NOTHING WAS SAVED.",
-                     "attention": "Finished: the form is filled but some values need your attention. NOTHING WAS SAVED.",
-                     "failed": "Stopped because of an error. NOTHING WAS SAVED.",
-                     "cancelled": "Cancelled. NOTHING WAS SAVED."}[state]
-            self._event(job, {"succeeded": "ok", "attention": "warn", "failed": "error", "cancelled": "warn"}[state], label, None)
+            ss = ((result or {}).get("save") or {}).get("state")
+            clicked = bool(job.get("save_clicked"))
+            level = {"succeeded": "ok", "attention": "warn", "failed": "error", "cancelled": "warn"}[state]
+            if ss == "saved":
+                label = "Finished: the entry is SAVED in the ERP."
+            elif ss == "unconfirmed":
+                label, level = "Finished: Save was clicked but the ERP did not clearly confirm it. CHECK THE ERP before running this entry again.", "error"
+            elif ss == "rejected":
+                label, level = "Finished: the ERP refused to save. Nothing was saved.", "error"
+            elif clicked:
+                label, level = "Stopped after Save was clicked. CHECK THE ERP before running this entry again.", "error"
+            else:
+                label = {"succeeded": "Finished: the ERP form is filled. NOTHING WAS SAVED.",
+                         "attention": "Finished: the form is filled but some values need your attention. NOTHING WAS SAVED.",
+                         "failed": "Stopped because of an error. NOTHING WAS SAVED.",
+                         "cancelled": "Cancelled. NOTHING WAS SAVED."}[state]
+            self._event(job, level, label, None)
         self._save(job)
 
     def _loop(self) -> None:
@@ -346,7 +399,24 @@ class RunManager:
                                                "hint": "Rebuild the app image: docker compose build app",
                                                "retryable": False, "details": {}})
             return
-        result = run(payload, reporter)
+        kwargs = {}
+        if self.credential_provider is not None:      # the person who pressed the button: their own ERP login
+            try:
+                login = self.credential_provider(job.get("requested_by"))
+            except Exception as e:
+                self._finish(job, "failed", None, {"code": "ERP_LOGIN_MISSING", "title": "No ERP login saved",
+                                                   "message": str(e)[:300],
+                                                   "hint": "Click 'My ERP login' at the top of the page, save your ERP username and password, then run it again.",
+                                                   "retryable": False, "details": {}})
+                return
+            if login is not None:
+                kwargs["login"] = login               # never stored in the job: it lives only inside this call
+                self._event(job, "info", f"Using the ERP login of {job.get('requested_by')}", None)
+        if self.hooks_factory is not None:
+            hooks = _TrackedHooks(self.hooks_factory(job["entry_id"], job.get("requested_by")), job)
+            result = run(payload, reporter, hooks=hooks, **kwargs)
+        else:
+            result = run(payload, reporter, **kwargs)
         with self.lock:
             job["attempts"] = result.get("attempts", 0)
         outcome = result.get("outcome", "failed")

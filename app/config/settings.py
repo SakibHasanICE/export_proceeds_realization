@@ -59,12 +59,35 @@ class Settings:
     imap_user = os.getenv("IMAP_USER", "")            # e.g. something@urmigroup.net
     imap_password = os.getenv("IMAP_PASSWORD", "")
     imap_folder = os.getenv("IMAP_FOLDER", "INBOX")
-    # whitelist: full addresses ("a@b.com") or domains ("hsbc.com.bd" / "@hsbc.com.bd")
-    known_senders = _csv("KNOWN_BANK_SENDERS")
     reject_dmarc_fail = _bool("REJECT_DMARC_FAIL", True)
 
+    # Personalised mailbox: staff send bank PDF/Excel files to this mailbox from their OWN @urmigroup.net address.
+    # Mail is picked up by sender address (seen/unseen does not matter) and every entry belongs to its sender.
+    # How many days back the mailbox is scanned on each cycle (already processed mail is skipped by Message-ID).
+    imap_lookback_days = int(os.getenv("IMAP_LOOKBACK_DAYS", "7"))
+    # Master accounts see every user's data (comma separated full addresses).
+    master_emails = _csv("MASTER_EMAILS")
+
+    # --- personal ERP logins: every user saves their own ERP username/password (encrypted with this key)
+    # make a key:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    erp_credential_key = os.getenv("ERP_CREDENTIAL_KEY", "").strip()
+    # true = a user without a personal ERP login runs with the shared ERP_USERNAME/ERP_PASSWORD from .env
+    erp_fallback_shared = _bool("ERP_FALLBACK_SHARED", False)
+
+    # --- notification mail ("your data is processed and ready to proceed in the ERP")
+    notify_enabled = _bool("NOTIFY_ENABLED", True)
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))                      # 587 = STARTTLS, 465 = SSL
+    smtp_user = os.getenv("SMTP_USER", "") or os.getenv("IMAP_USER", "")
+    smtp_password = os.getenv("SMTP_PASSWORD", "") or os.getenv("IMAP_PASSWORD", "")
+    notify_from = os.getenv("NOTIFY_FROM", "")                           # default: the SMTP user
+    app_url = os.getenv("APP_URL", "").strip()                            # link shown in the notification mail
+
     # --- scheduler
-    poll_minutes = int(os.getenv("POLL_MINUTES", "60"))
+    # Real time: IMAP IDLE processes a mail the moment it arrives. The poll below is only a safety net.
+    imap_idle = _bool("IMAP_IDLE", True)
+    imap_idle_minutes = int(os.getenv("IMAP_IDLE_MINUTES", "15"))       # reconnect (keep-alive) interval
+    poll_minutes = int(os.getenv("POLL_MINUTES", "5"))
     scheduler_enabled = _bool("SCHEDULER_ENABLED", True)
     staging_dir = Path(os.getenv("STAGING_DIR", BASE_DIR / "staging"))
 

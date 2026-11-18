@@ -2,16 +2,20 @@
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.common.logger import get_logger
+from app.backend.auth import can_access, is_master, owner_scope
 from app.components import database
 from app.config.settings import settings
+from app.components import secret_box
+from app.erp_worker import credentials
 from app.erp_worker.runner import RunManager
+from app.erp_worker.save_hooks import DbSaveHooks
 from app.erp_worker.view import build_erp_view, build_run_payload
 
 log = get_logger(__name__)
@@ -31,7 +35,8 @@ def _load_payload(entry_id: int) -> dict:
 def get_manager() -> RunManager:
     global _manager
     if _manager is None:
-        _manager = RunManager(RUN_DIR, _load_payload)
+        _manager = RunManager(RUN_DIR, _load_payload, hooks_factory=lambda eid, user: DbSaveHooks(eid, user),
+                              credential_provider=credentials.login_for)
     return _manager
 
 
@@ -39,37 +44,93 @@ class RunRequest(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=100)
 
 
+class ErpLoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class SaveResolution(BaseModel):
+    resolution: Literal["saved", "not_saved"]
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+def save_enabled() -> bool:
+    return os.getenv("ERP_SAVE_ENABLED", "false").strip().lower() == "true"
+
+
 def build_router(require_key, current_user) -> APIRouter:
     router = APIRouter(prefix="/erp", dependencies=[Depends(require_key), Depends(current_user)])
 
+    def job_ok(job_summary: Optional[dict], user: Optional[str]) -> bool:
+        """A run belongs to whoever owns its entry."""
+        if job_summary is None:
+            return False
+        rec = database.get_realization(job_summary["entry_id"])
+        return rec is not None and can_access(rec.get("owner_email"), user)
+
     @router.get("/entries")
-    def entries(status: Optional[str] = None, needs_review: Optional[bool] = None):
+    def entries(status: Optional[str] = None, needs_review: Optional[bool] = None,
+                user: Optional[str] = Depends(current_user)):
         mgr = get_manager()
         latest = mgr.latest_by_entry()
-        rows = sorted(database.list_realizations(status, needs_review), key=lambda r: r["id"], reverse=True)
+        rows = sorted(database.list_realizations(status, needs_review, owner_email=owner_scope(user)),
+                      key=lambda r: r["id"], reverse=True)
         out = []
         for rec in rows:
             v = build_erp_view(rec)
             v["last_run"] = latest.get(rec["id"])
             out.append(v)
-        return {"entries": out, "worker": mgr.worker_status(),
-                "erp_configured": bool(os.getenv("ERP_USERNAME") and os.getenv("ERP_PASSWORD"))}
+        master = is_master(user)
+        owners = sorted({v["owner_email"] for v in out if v.get("owner_email")}) if master else []
+        return {"entries": out, "worker": mgr.worker_status(), "save_enabled": save_enabled(),
+                "viewer": {"email": user, "is_master": master}, "owners": owners,
+                "erp_login": credentials.mode_for(user),
+                "erp_configured": bool(os.getenv("ERP_USERNAME") and os.getenv("ERP_PASSWORD"))
+                                  or credentials.mode_for(user)["mode"] != "missing"}
+
+    @router.get("/credentials/me")
+    def my_login(user: Optional[str] = Depends(current_user)):
+        """Whether this user has saved an ERP login. The password is never sent back."""
+        return credentials.mode_for(user)
+
+    @router.put("/credentials/me")
+    def save_my_login(body: ErpLoginIn, user: Optional[str] = Depends(current_user)):
+        if not user or not settings.allowed_email_domain:
+            raise HTTPException(400, "Sign-in is switched off, so the shared ERP login from .env is used.")
+        try:
+            enc = secret_box.encrypt(body.password)
+        except secret_box.SecretBoxError as e:
+            raise HTTPException(503, str(e))
+        database.save_erp_credential(user, body.username.strip(), enc)
+        credentials.forget_session(user)             # an old saved browser session may belong to the old login
+        log.info("ERP login saved for %s", user)
+        return credentials.mode_for(user)
+
+    @router.delete("/credentials/me")
+    def delete_my_login(user: Optional[str] = Depends(current_user)):
+        if user:
+            database.delete_erp_credential(user)
+            credentials.forget_session(user)
+        return credentials.mode_for(user)
 
     @router.post("/runs")
     def start_runs(body: RunRequest, user: Optional[str] = Depends(current_user)):
-        """Queue one run per entry. Runs happen one after another; nothing is ever saved in the ERP."""
+        """Queue one run per entry, one after another. Each run fills the ERP form and, only when ERP_SAVE_ENABLED=true
+        and every check is clean, clicks Save."""
         mgr = get_manager()
+        if credentials.mode_for(user)["mode"] == "missing":
+            raise HTTPException(409, "Save your ERP login first: click 'My ERP login' at the top of the page.")
         ok, skipped = [], []
         for eid in dict.fromkeys(body.entry_ids):
             rec = database.get_realization(eid)
-            if rec is None:
+            if rec is None or not can_access(rec.get("owner_email"), user):
                 skipped.append({"entry_id": eid, "reason": "entry not found"})
                 continue
             view = build_erp_view(rec)
             if not view["can_run"]:
                 skipped.append({"entry_id": eid, "reason": "; ".join(view["blockers"])})
                 continue
-            ok.append({"entry_id": eid, "bill_no": rec["bill_invoice_no"], "bank": rec["bank"]})
+            ok.append({"entry_id": eid, "bill_no": rec["bill_invoice_no"], "bank": rec["bank"], "requested_by": user})
         res = mgr.submit(ok) if ok else {"batch_id": None, "jobs": [], "skipped": []}
         not_queued = {s["entry_id"] for s in res["skipped"]}
         for item in ok:                      # remember when and who pressed the button, for the table
@@ -78,22 +139,43 @@ def build_router(require_key, current_user) -> APIRouter:
         res["skipped"] = skipped + res["skipped"]
         return res
 
+    @router.post("/entries/{entry_id}/save-resolution")
+    def resolve_save(entry_id: int, body: SaveResolution, user: Optional[str] = Depends(current_user)):
+        """A person checked the ERP after a Save the robot could not confirm: it WAS saved, or it was NOT."""
+        rec = database.get_realization(entry_id)
+        if rec is None or not can_access(rec.get("owner_email"), user):
+            raise HTTPException(404, "entry not found")
+        if not (rec.get("meta") or {}).get("erp_save_state"):
+            raise HTTPException(409, "this entry has no unresolved save")
+        if get_manager().active_for_entry(entry_id):
+            raise HTTPException(409, "a run is still in progress for this entry")
+        who = user or "a user"
+        extra = f" ({body.note})" if body.note else ""
+        if body.resolution == "saved":
+            database.mark_saved_in_erp(entry_id, note=f"confirmed in the ERP by {who}{extra}", by=user)
+        else:
+            database.set_erp_save_state(entry_id, None, note=f"confirmed NOT saved in the ERP by {who}{extra}", by=user)
+        return build_erp_view(database.get_realization(entry_id))
+
     @router.get("/runs/{job_id}")
-    def job(job_id: str, since: int = 0):
+    def job(job_id: str, since: int = 0, user: Optional[str] = Depends(current_user)):
         j = get_manager().get_job(job_id, since)
-        if j is None:
+        if j is None or not job_ok(j, user):
             raise HTTPException(404, "run not found")
         return j
 
     @router.post("/runs/{job_id}/cancel")
-    def cancel_job(job_id: str):
-        s = get_manager().cancel_job(job_id)
-        if s is None:
+    def cancel_job(job_id: str, user: Optional[str] = Depends(current_user)):
+        j = get_manager().get_job(job_id, 10**9)
+        if j is None or not job_ok(j, user):
             raise HTTPException(404, "run not found")
-        return s
+        return get_manager().cancel_job(job_id)
 
     @router.get("/entries/{entry_id}/runs")
-    def entry_history(entry_id: int, limit: int = 10):
+    def entry_history(entry_id: int, limit: int = 10, user: Optional[str] = Depends(current_user)):
+        rec = database.get_realization(entry_id)
+        if rec is None or not can_access(rec.get("owner_email"), user):
+            raise HTTPException(404, "entry not found")
         mgr = get_manager()
         with mgr.lock:
             jobs = sorted((j for j in mgr.jobs.values() if j["entry_id"] == entry_id),
@@ -101,23 +183,28 @@ def build_router(require_key, current_user) -> APIRouter:
             return [mgr.summary(j) for j in jobs]
 
     @router.get("/batches/{batch_id}")
-    def batch(batch_id: str):
+    def batch(batch_id: str, user: Optional[str] = Depends(current_user)):
         b = get_manager().get_batch(batch_id)
-        if b is None:
+        if b is None or not all(job_ok(j, user) for j in b["jobs"]):
             raise HTTPException(404, "batch not found")
         return b
 
     @router.post("/batches/{batch_id}/cancel")
-    def cancel_batch(batch_id: str):
-        b = get_manager().cancel_batch(batch_id)
-        if b is None:
+    def cancel_batch(batch_id: str, user: Optional[str] = Depends(current_user)):
+        b = get_manager().get_batch(batch_id)
+        if b is None or not all(job_ok(j, user) for j in b["jobs"]):
             raise HTTPException(404, "batch not found")
-        return b
+        return get_manager().cancel_batch(batch_id)
 
     @router.get("/screens/{name}")
-    def screen(name: str):
+    def screen(name: str, user: Optional[str] = Depends(current_user)):
         if not re.fullmatch(r"[\w\-.]+\.png", name):
             raise HTTPException(400, "bad file name")
+        mgr = get_manager()
+        with mgr.lock:                      # a screenshot is visible only to the owner of the run that took it
+            owners = [mgr.summary(j) for j in mgr.jobs.values() if any(s.get("file") == name for s in j["shots"])]
+        if not owners or not all(job_ok(o, user) for o in owners):
+            raise HTTPException(404, "screenshot not found")
         path = (SHOT_DIR / name).resolve()
         if SHOT_DIR.resolve() not in path.parents or not path.is_file():
             raise HTTPException(404, "screenshot not found")

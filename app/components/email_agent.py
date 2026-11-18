@@ -6,13 +6,14 @@ import io
 import re
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import policy
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 from app.common.custom_exception import CustomException
 from app.common.logger import get_logger
+from app.components import database
 from app.config.settings import settings
 
 log = get_logger(__name__)
@@ -26,6 +27,8 @@ class IncomingMail:
     subject: str
     date: datetime | None
     attachments: list[Path] = field(default_factory=list)
+    names: list[str] = field(default_factory=list)       # the attachments' original file names, same order
+    owner_email: str | None = None                       # the staff member who sent it (None = a bank wrote directly)
 
 
 def sender_allowed(address: str, allowed: list[str]) -> bool:
@@ -40,6 +43,22 @@ def sender_allowed(address: str, allowed: list[str]) -> bool:
             if address.endswith("@" + domain):
                 return True
     return False
+
+
+def is_user_sender(address: str) -> bool:
+    """A staff address of the signed-in domain (ALLOWED_EMAIL_DOMAIN): their mail belongs to them."""
+    domain = settings.allowed_email_domain
+    address = address.lower().strip()
+    return bool(domain) and address.endswith("@" + domain) and address != settings.imap_user.lower()
+
+
+def accepted_sender(address: str) -> bool:
+    """Only staff addresses: every entry belongs to the person who sent it. Bank mail is no longer read directly."""
+    return is_user_sender(address)
+
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+_checked: set[str] = set()      # uids already looked at and not wanted (not a staff/bank sender, DMARC fail, done)
 
 
 def extract_pdf_attachments(msg) -> list[tuple[str, bytes]]:
@@ -118,40 +137,69 @@ class EmailAgent:
                 pass
             self.conn = None
 
-    def _unseen_uids(self) -> list[str]:
-        uids: set[str] = set()
-        for sender in settings.known_senders:
-            typ, data = self.conn.uid("SEARCH", None, "UNSEEN", "FROM", f'"{sender}"')
-            if typ == "OK" and data and data[0]:
-                uids.update(u.decode() for u in data[0].split())
-        return sorted(uids, key=int)
+    def _since_uids(self) -> list[str]:
+        """Every mail of the last IMAP_LOOKBACK_DAYS days, seen or unseen: whether it was read does not matter."""
+        d = datetime.now() - timedelta(days=max(1, settings.imap_lookback_days))
+        since = f"{d.day:02d}-{_MONTHS[d.month - 1]}-{d.year}"
+        typ, data = self.conn.uid("SEARCH", None, "SINCE", since)
+        if typ != "OK" or not data or not data[0]:
+            return []
+        return sorted((u.decode() for u in data[0].split()), key=int)
+
+    def _uidvalidity(self) -> str:
+        try:
+            return self.conn.response("UIDVALIDITY")[1][0].decode()
+        except Exception:
+            return "0"
+
+    def _header(self, uid: str):
+        typ, data = self.conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM MESSAGE-ID)])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return None
+        return email.message_from_bytes(data[0][1], policy=policy.default)
 
     def fetch_new(self):
-        """Yield IncomingMail for unseen, whitelisted mail. Does NOT mark it seen (BODY.PEEK)."""
-        if not settings.known_senders:
-            log.warning("KNOWN_BANK_SENDERS is empty: ignoring all mail")
+        """Yield IncomingMail for every not-yet-processed mail from a staff address.
+
+        Seen/unseen is ignored. Nothing is marked: a mail is done once its Message-ID is in processed_emails."""
+        if not settings.allowed_email_domain:
+            log.warning("ALLOWED_EMAIL_DOMAIN is empty: ignoring all mail")
             return
-        for uid in self._unseen_uids():
+        validity = self._uidvalidity()
+        for uid in self._since_uids():
+            key = f"{validity}:{uid}"
+            if key in _checked:
+                continue
+            head = self._header(uid)
+            if head is None:
+                continue
+            sender = parseaddr(str(head.get("From", "")))[1].lower()
+            if not accepted_sender(sender):
+                _checked.add(key)
+                continue
+            hmid = str(head.get("Message-ID") or "").strip()
+            if hmid and database.email_already_processed(hmid):
+                _checked.add(key)
+                continue
             typ, data = self.conn.uid("FETCH", uid, "(BODY.PEEK[])")
             if typ != "OK" or not data or not isinstance(data[0], tuple):
                 continue
             raw = data[0][1]
             msg = email.message_from_bytes(raw, policy=policy.default)
-            sender = parseaddr(str(msg.get("From", "")))[1].lower()
-            if not sender_allowed(sender, settings.known_senders):
-                log.info("uid %s: sender %s not whitelisted, ignored", uid, sender)
-                continue
             auth = str(msg.get("Authentication-Results", "")).lower()
             if settings.reject_dmarc_fail and "dmarc=fail" in auth:
                 log.warning("uid %s: DMARC fail for %s, ignored (possible spoof)", uid, sender)
+                _checked.add(key)
                 continue
-            mid = str(msg.get("Message-ID") or "").strip() or "sha1-" + hashlib.sha1(raw).hexdigest()
+            mid = hmid or "sha1-" + hashlib.sha1(raw).hexdigest()
             try:
                 date = parsedate_to_datetime(str(msg.get("Date"))) if msg.get("Date") else None
             except (TypeError, ValueError):
                 date = None
-            paths = save_attachments(mid, extract_attachments(msg), settings.staging_dir)
-            yield IncomingMail(uid, mid, sender, str(msg.get("Subject", "")), date, paths)
+            atts = extract_attachments(msg)
+            paths = save_attachments(mid, atts, settings.staging_dir)
+            yield IncomingMail(uid, mid, sender, str(msg.get("Subject", "")), date, paths,
+                               [n for n, _ in atts], sender)
 
     def mark_seen(self, uid: str) -> None:
         self.conn.uid("STORE", uid, "+FLAGS", r"(\Seen)")

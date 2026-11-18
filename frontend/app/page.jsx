@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import EntriesTable from "../components/EntriesTable";
+import ErpLoginButton from "../components/ErpLoginButton";
 import RunTracker from "../components/RunTracker";
 import StatusGuide from "../components/StatusGuide";
 import UploadButton from "../components/UploadButton";
@@ -9,10 +10,19 @@ import { uploadFiles } from "../lib/upload";
 import { api, post } from "../lib/api";
 import { ACTIVE } from "../lib/format";
 
+function skippedShown(n) {
+  return n > 0 ? ` (${n} not ready, will be skipped)` : "";
+}
+
 export default function Page() {
   const [entries, setEntries] = useState([]);
   const [worker, setWorker] = useState({ busy: false, queued: 0 });
   const [erpConfigured, setErpConfigured] = useState(true);
+  const [saveEnabled, setSaveEnabled] = useState(false); // true = the robot clicks Save in the ERP (ERP_SAVE_ENABLED)
+  const [viewer, setViewer] = useState({ email: null, is_master: false }); // is_master: sees every user's data
+  const [owners, setOwners] = useState([]);
+  const [erpLogin, setErpLogin] = useState({ mode: "shared", username: null }); // this user's own ERP login (personal | shared | missing)
+  const [ownerFilter, setOwnerFilter] = useState("all");
   const [loadError, setLoadError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("all");
@@ -40,6 +50,10 @@ export default function Page() {
       setEntries(d.entries);
       setWorker(d.worker);
       setErpConfigured(d.erp_configured);
+      setSaveEnabled(!!d.save_enabled);
+      setViewer(d.viewer || { email: null, is_master: false });
+      setOwners(d.owners || []);
+      setErpLogin(d.erp_login || { mode: "shared", username: null });
       setLoadError(null);
     } catch (e) {
       setLoadError(e.message);
@@ -67,12 +81,13 @@ export default function Page() {
     return entries.filter((e) => {
       if (status !== "all" && e.status !== status) return false;
       if (onlyReady && !e.can_run) return false;
+      if (ownerFilter !== "all" && (e.owner_email || "") !== (ownerFilter === "none" ? "" : ownerFilter)) return false;
       if (!q) return true;
-      return [e.id, e.bank, e.bill_invoice_no, e.beneficiary, e.buyer, e.lc_sc_no]
+      return [e.id, e.bank, e.bill_invoice_no, e.beneficiary, e.buyer, e.lc_sc_no, e.owner_email]
         .map((x) => String(x || "").toLowerCase())
         .some((x) => x.includes(q));
     });
-  }, [entries, status, search, onlyReady]);
+  }, [entries, status, search, onlyReady, ownerFilter]);
 
   // One column per account number found in the shown documents (value = amount distributed to it)
   const accounts = useMemo(() => {
@@ -91,6 +106,8 @@ export default function Page() {
   const runnable = visible.filter((e) => e.can_run && !activeIds.has(e.id));
   // only rows that are still visible and still ready count, so nothing hidden by a filter is sent by accident
   const picked = runnable.filter((e) => selected.has(e.id));
+  const selectedShown = visible.filter((e) => selected.has(e.id)).length;
+  const skippedSelected = selectedShown - picked.length; // selected, but not ready (running, filled, blocked)
 
   async function run(ids) {
     try {
@@ -98,9 +115,8 @@ export default function Page() {
       if (r.skipped && r.skipped.length) {
         flash("Not started: " + r.skipped.map((s) => `#${s.entry_id} (${s.reason})`).join("; "), 12000);
       }
-      if (r.jobs.length) {
-        setTracker({ batchId: r.jobs.length > 1 ? r.batch_id : null, jobId: r.jobs[0] });
-      }
+      // the Run tracker is not opened automatically: click the value in the "ERP run" column to see it
+      if (r.jobs.length) flash(`Started ${r.jobs.length} run${r.jobs.length > 1 ? "s" : ""}. Click the ERP run status to see the steps.`, 6000);
       load();
     } catch (e) {
       flash(`Could not start: ${e.message}`, 12000);
@@ -125,24 +141,36 @@ export default function Page() {
     });
   }
 
+  // one document (row button, tracker Retry): run straight away, no popup
+  function requestRun(ids) {
+    run(ids);
+  }
+
   function runSelected() {
     if (picked.length === 0) return;
-    const ok = window.confirm(
-      `Fill the ${picked.length} selected document(s) in the ERP, one after another?\n\n` +
-        "The robot only fills the forms and takes screenshots. It never clicks Save."
-    );
-    if (!ok) return;
     run(picked.map((e) => e.id));
     setSelected(new Set());
   }
 
   function runAll() {
     if (runnable.length === 0) return;
-    const ok = window.confirm(
-      `Fill ${runnable.length} document(s) in the ERP, one after another?\n\n` +
-        "The robot only fills the forms and takes screenshots. It never clicks Save."
-    );
-    if (ok) run(runnable.map((e) => e.id));
+    run(runnable.map((e) => e.id));
+  }
+
+  // After a Save the robot could not confirm, a person looks in the ERP and says what is true
+  async function resolveSave(id, resolution) {
+    const q =
+      resolution === "saved"
+        ? `Entry #${id}: you checked the ERP and this entry IS saved there?\n\nIt will be marked as saved.`
+        : `Entry #${id}: you checked the ERP and this entry is NOT saved there?\n\nIt will become runnable again.`;
+    if (!window.confirm(q)) return;
+    try {
+      await post(`/erp/entries/${id}/save-resolution`, { resolution });
+      flash(resolution === "saved" ? `Entry #${id} marked as saved.` : `Entry #${id} can be run again.`);
+      load();
+    } catch (e) {
+      flash(`Could not update entry #${id}: ${e.message}`, 12000);
+    }
   }
 
   async function poll() {
@@ -167,6 +195,7 @@ export default function Page() {
     if (id) {
       setStatus("all");
       setSearch("");
+      setOwnerFilter("all");
       setHighlightId(id);
       setTimeout(() => setHighlightId(null), 15000);
     }
@@ -193,12 +222,25 @@ export default function Page() {
           <div>
             <h1>Export Proceeds Realization</h1>
             <div className="muted">
-              Review what will be filled, then send it to the ERP. <b>Test mode: nothing is ever saved in the ERP.</b>
+              {viewer.is_master ? "Master view: documents of all users. " : "Your documents (sent from your own mail address). "}
+              Review what will be filled, then send it to the ERP.{" "}
+              {saveEnabled ? (
+                <b>Live mode: clean entries are saved in the ERP.</b>
+              ) : (
+                <b>Test mode: nothing is ever saved in the ERP.</b>
+              )}
             </div>
           </div>
           <UserMenu />
         </header>
 
+        {/* {saveEnabled && (
+          <div className="banner banner-live">
+            <b>LIVE MODE.</b> The robot fills the ERP form, reads every value back, and clicks <b>Save</b> only when
+            everything matches the database. If the ERP does not clearly confirm a save, the entry is blocked until a
+            person checks the ERP and answers “It was saved” or “Not saved”.
+          </div>
+        )} */}
         {!erpConfigured && (
           <div className="banner banner-warn">
             ERP_USERNAME / ERP_PASSWORD are not set in .env, so runs will fail at login.
@@ -214,9 +256,17 @@ export default function Page() {
             <option value="pending">pending</option>
             <option value="filled">filled</option>
           </select>
+          {viewer.is_master && (
+            <select className="input" value={ownerFilter} onChange={(e) => setOwnerFilter(e.target.value)}>
+              <option value="all">All users</option>
+              {owners.map((o) => <option key={o} value={o}>{o}</option>)}
+              <option value="none">No owner (old data / bank mail)</option>
+            </select>
+          )}
           <label className="check"><input type="checkbox" checked={onlyReady} onChange={(e) => setOnlyReady(e.target.checked)} /> only ready to run</label>
           <label className="check"><input type="checkbox" checked={showLines} onChange={(e) => setShowLines(e.target.checked)} /> show line details</label>
           <span className="spacer" />
+          {viewer.email && <ErpLoginButton login={erpLogin} onChange={load} onNotice={flash} />}
           <UploadButton onDone={uploaded} onNotice={flash} />
           <span className="muted small">{worker.busy ? "Robot is working" : "Robot is idle"}{worker.queued ? ` · ${worker.queued} queued` : ""}</span>
           <button className="btn" onClick={() => setShowGuide(!showGuide)}>Status guide</button>
@@ -237,7 +287,10 @@ export default function Page() {
             onToggle={toggle}
             activeIds={activeIds}
             highlightId={highlightId}
-            onRun={run}
+            onRun={requestRun}
+            saveEnabled={saveEnabled}
+            showOwner={viewer.is_master}
+            onResolve={resolveSave}
             onOpenRun={(r) => setTracker({ batchId: null, jobId: r.id })}
             selected={selected}
             onSelect={toggleSelect}
@@ -251,7 +304,7 @@ export default function Page() {
         tracker={tracker}
         onSelectJob={(jobId) => setTracker((t) => ({ ...t, jobId }))}
         onClose={() => setTracker(null)}
-        onRetry={(id) => run([id])}
+        onRetry={(id) => requestRun([id])}
         onJobFinished={load}
         onNotice={flash}
       />
@@ -259,23 +312,30 @@ export default function Page() {
       <footer className="footbar">
         <div>
           <b>{runnable.length}</b> of {visible.length} shown document(s) are ready to send.
-          <span className="muted"> The robot works one by one and never saves.</span>
+          <span className="muted">
+            {saveEnabled ? " The robot works one by one and saves only entries that match." : " The robot works one by one and never saves."}
+          </span>
         </div>
         <div className="footbtns">
-          {picked.length > 0 && (
+          {selectedShown > 0 && (
             <>
+              <span className="muted small">
+                {selectedShown} selected{skippedShown(skippedSelected)}
+              </span>
               <button className="link" onClick={() => setSelected(new Set())}>Clear selection</button>
-              <button className="btn btn-primary btn-big" onClick={runSelected}>
-                Proceed selected to ERP ({picked.length})
-              </button>
             </>
+          )}
+          {picked.length > 0 && (
+            <button className="btn btn-primary btn-big" onClick={runSelected}>
+              Selected Proceed to ERP ({picked.length})
+            </button>
           )}
           <button
             className={"btn btn-big " + (picked.length > 0 ? "" : "btn-primary")}
             disabled={runnable.length === 0}
             onClick={runAll}
           >
-            Proceed all to ERP ({runnable.length})
+            All Proceed to ERP ({runnable.length})
           </button>
         </div>
       </footer>

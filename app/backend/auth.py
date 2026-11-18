@@ -21,3 +21,18 @@ def current_user(x_user_email: Optional[str] = Header(default=None)) -> Optional
         if not _EMAIL.fullmatch(email) or not email.endswith("@" + domain):
             raise HTTPException(401, f"sign in with your @{domain} Google account")
     return email if _EMAIL.fullmatch(email) else None
+
+
+def is_master(email: Optional[str]) -> bool:
+    """Master accounts (MASTER_EMAILS) see every user's data. With sign-in switched off everybody does."""
+    return not settings.allowed_email_domain or (email or "").strip().lower() in settings.master_emails
+
+
+def owner_scope(email: Optional[str]) -> Optional[str]:
+    """What to filter the data by: None = no filter (master), otherwise the user's own address."""
+    return None if is_master(email) else (email or "").strip().lower()
+
+
+def can_access(owner_email: Optional[str], email: Optional[str]) -> bool:
+    scope = owner_scope(email)
+    return scope is None or (owner_email or "").lower() == scope

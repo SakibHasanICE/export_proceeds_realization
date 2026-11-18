@@ -7,7 +7,9 @@ from app.common.logger import get_logger
 from app.components import database, ledger
 from app.components.ai_agent import extract_document
 from app.components.ebl_parser import is_workbook, parse_workbook
+from app.components import idle_listener
 from app.components.email_agent import EmailAgent
+from app.components.notifier import notify_processed
 from app.config.settings import settings
 
 log = get_logger(__name__)
@@ -24,14 +26,14 @@ def arrival_date(mail_date: datetime | None) -> date:
 
 
 def process_workbook(path: Path, message_id: str | None = None, mail_date: datetime | None = None,
-                     replace: bool = False) -> dict:
+                     replace: bool = False, owner_email: str | None = None, display_name: str | None = None) -> dict:
     """An EBL realization sheet holds many bills: store each one, report them individually."""
     try:
         recs = parse_workbook(path)
     except Exception as e:      # not an EBL sheet, or its layout changed: keep it for a human
         doc_id = database.save_other_document(
             {"source_file": path.name, "extractor": "none", "doc_type": None, "needs_review": True,
-             "issues": [f"spreadsheet not recognised as an EBL realization sheet: {e}"]}, message_id)
+             "issues": [f"spreadsheet not recognised as an EBL realization sheet: {e}"]}, message_id, owner_email)
         log.warning("%s -> other document %s (%s)", path.name, doc_id, e)
         return {"file": path.name, "status": "other_document", "id": doc_id, "needs_review": True,
                 "issues": [str(e)]}
@@ -39,7 +41,9 @@ def process_workbook(path: Path, message_id: str | None = None, mail_date: datet
     arrived = arrival_date(mail_date).isoformat()
     for rec in recs:
         rec["meta"]["arrived_on"] = arrived
-        status, rid = database.save_realization(rec, message_id, replace)
+        if display_name:
+            rec["source_file"] = display_name
+        status, rid = database.save_realization(rec, message_id, replace, owner_email)
         log.info("%s [%s] -> %s (id %s, review=%s)", path.name, rec["bill_invoice_no"], status, rid, rec["needs_review"])
         results.append({"file": path.name, "bill": rec["bill_invoice_no"], "status": status, "id": rid,
                         "needs_review": rec["needs_review"], "issues": rec["issues"]})
@@ -51,28 +55,50 @@ def process_workbook(path: Path, message_id: str | None = None, mail_date: datet
 
 
 def process_file(path: Path | str, message_id: str | None = None, mail_date: datetime | None = None,
-                 replace: bool = False) -> dict:
+                 replace: bool = False, owner_email: str | None = None, display_name: str | None = None) -> dict:
     """Extract one staged PDF (or EBL .xlsx) and store the result. mail_date = when the bank mail arrived."""
     path = Path(path)
     if is_workbook(path):
-        return process_workbook(path, message_id, mail_date, replace)
+        return process_workbook(path, message_id, mail_date, replace, owner_email, display_name)
     rec = extract_document(str(path))
+    if display_name:
+        rec["source_file"] = display_name
     if rec.get("extractor") == "rules" and rec.get("doc_type") == "export_payment_advice" \
             and not rec.get("unsupported"):
         rec.setdefault("meta", {})["arrived_on"] = arrival_date(mail_date).isoformat()
-        status, rid = database.save_realization(rec, message_id, replace)
+        status, rid = database.save_realization(rec, message_id, replace, owner_email)
         ledger.sync()
         log.info("%s -> %s (id %s, review=%s)", path.name, status, rid, rec["needs_review"])
         return {"file": path.name, "status": status, "id": rid, "needs_review": rec["needs_review"],
                 "issues": rec["issues"]}
-    doc_id = database.save_other_document(rec, message_id)
+    doc_id = database.save_other_document(rec, message_id, owner_email)
     log.info("%s -> other document %s (%s)", path.name, doc_id, rec.get("doc_type"))
     return {"file": path.name, "status": "other_document", "id": doc_id,
             "needs_review": True, "issues": rec.get("issues", [])}
 
 
+_again = threading.Event()
+
+
 def run_cycle() -> dict:
-    """Poll the mailbox once. Safe to call from the scheduler and the API at the same time."""
+    """Poll the mailbox once. Safe to call from the scheduler, the IDLE listener and the API at the same time.
+
+    If a cycle is already running, it is asked to look once more when it finishes, so a mail that arrived in
+    the meantime is not left waiting."""
+    first = _run_cycle_locked()
+    if "skipped" in first:
+        _again.set()
+        return first
+    while _again.is_set():
+        _again.clear()
+        nxt = _run_cycle_locked()
+        if "skipped" in nxt:
+            break
+        first = {k: first.get(k, 0) + nxt.get(k, 0) for k in first}
+    return first
+
+
+def _run_cycle_locked() -> dict:
     if not _cycle_lock.acquire(blocking=False):
         return {"skipped": "a cycle is already running"}
     stats = {"emails": 0, "attachments": 0, "saved": 0, "duplicates": 0,
@@ -81,18 +107,20 @@ def run_cycle() -> dict:
         with EmailAgent() as agent:
             for mail in agent.fetch_new():
                 if database.email_already_processed(mail.message_id):
-                    agent.mark_seen(mail.uid)
                     continue
                 stats["emails"] += 1
-                if not mail.attachments:                      # diagram: no attachment -> ignore email
+                if not mail.attachments:                      # no PDF/Excel -> nothing to do, remember the mail
                     database.log_email(mail.message_id, mail.sender, mail.subject, "no_pdf")
-                    agent.mark_seen(mail.uid)
                     continue
                 all_ok = True
-                for path in mail.attachments:
+                results: list[dict] = []
+                for i, path in enumerate(mail.attachments):
                     stats["attachments"] += 1
+                    name = mail.names[i] if i < len(mail.names) else path.name
                     try:
-                        res = process_file(path, mail.message_id, mail.date)
+                        res = process_file(path, mail.message_id, mail.date, owner_email=mail.owner_email,
+                                           display_name=name)
+                        results.append(res)
                         for one in res.get("results") or [res]:     # a workbook reports one result per bill
                             key = {"saved": "saved", "duplicate": "duplicates",
                                    "other_document": "other_documents"}[one["status"]]
@@ -102,10 +130,13 @@ def run_cycle() -> dict:
                         all_ok = False
                         stats["errors"] += 1
                         log.exception("failed processing %s", path.name)
-                if all_ok:   # failed mail stays unseen and is retried next cycle
+                if all_ok:   # a failed mail is not logged, so the next cycle retries it
                     database.log_email(mail.message_id, mail.sender, mail.subject, "processed")
-                    agent.mark_seen(mail.uid)
+                    if mail.owner_email:                      # tell the staff member their data is ready
+                        notify_processed(mail.owner_email, mail.names, results, mail.subject)
         ledger.sync()                                 # catch-up if an earlier write was refused
+        if stats["emails"] or stats["errors"]:
+            log.info("cycle done: %s", stats)
     finally:
         _cycle_lock.release()
     log.info("cycle done: %s", stats)
@@ -124,6 +155,8 @@ def start_scheduler() -> threading.Thread:
     t = threading.Thread(target=loop, name="poller", daemon=True)
     t.start()
     log.info("scheduler started: every %s min", settings.poll_minutes)
+    if settings.imap_idle:
+        idle_listener.start(run_cycle, _stop)
     return t
 
 

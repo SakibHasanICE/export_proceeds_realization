@@ -1,5 +1,5 @@
 "use client";
-import { Fragment, useState } from "react";
+import { Fragment } from "react";
 import { DbStatus, ErpBadge } from "./Badges";
 import { dmy, money, rate, stamp } from "../lib/format";
 
@@ -15,14 +15,18 @@ function Head({ row }) {
   return <span className="muted">(empty)</span>;
 }
 
-function Lines({ e }) {
+function Lines({ e, saveEnabled }) {
   const t = e.totals || {};
   return (
     <div className="detail">
       <div className="detail-note">
         <b>What the robot will do:</b> select the Beneficiary, double-click Bill/Invoice No and pick the bill, then type
         the Received Date and the tables below. The ERP fills {e.erp_fills_itself.join(", ")} by itself from the bill.
-        <b> Nothing is saved.</b>
+        {saveEnabled ? (
+          <b> Then it reads every value back and clicks Save only if everything matches.</b>
+        ) : (
+          <b> Nothing is saved.</b>
+        )}
       </div>
 
       {(e.blockers.length > 0 || e.warnings.length > 0) && (
@@ -124,9 +128,7 @@ function remarkFor(e) {
 }
 
 export default function EntriesTable({ entries, accounts, showLines, activeIds, highlightId, onRun, onOpenRun, expanded, onToggle,
-  selected, onSelect, onSelectAll }) {
-  // The row the user clicked: stays tinted so it is easy to follow while scrolling sideways
-  const [selectedId, setSelectedId] = useState(null);
+  selected, onSelect, onSelectAll, saveEnabled, onResolve, showOwner }) {
   if (entries.length === 0) return <div className="empty">No documents match the filter.</div>;
   const pickable = entries.filter((e) => e.can_run && !activeIds.has(e.id));
   const pickedCount = pickable.filter((e) => selected.has(e.id)).length;
@@ -148,6 +150,7 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
               </div>
             </th>
             <th>ID</th>
+            {showOwner && <th title="The user who sent this document (master only)">Owner</th>}
             <th>Bank</th>
             <th>Bill/Invoice No</th>
             <th>Beneficiary</th>
@@ -185,20 +188,20 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
             return (
               <Fragment key={e.id}>
                 <tr
-                  className={[isActive ? "row-active" : e.id === highlightId ? "row-new" : "", selected.has(e.id) && canPick ? "row-checked" : "", e.id === selectedId ? "row-selected" : ""].join(" ").trim()}
+                  className={[isActive ? "row-active" : e.id === highlightId ? "row-new" : "", selected.has(e.id) ? "row-selected" : ""].join(" ").trim()}
                   onClick={(ev) => {
-                    // click a row to mark it; click it again (not on a button) to clear
-                    const onControl = ev.target.closest("button, a, input, select");
-                    setSelectedId((cur) => (cur === e.id && !onControl ? null : e.id));
+                    // click anywhere on the row to select it (grey); click again to unselect.
+                    // Buttons, links and the checkbox keep their own behaviour.
+                    if (ev.target.closest("button, a, input, select, label")) return;
+                    onSelect(e.id);
                   }}
                 >
                   <td className="stick-l">
                     <div className="firstcell">
                       <input
                         type="checkbox"
-                        checked={selected.has(e.id) && canPick}
-                        disabled={!canPick}
-                        title={canPick ? "Select this document for “Proceed selected to ERP”" : reason || "Cannot be selected"}
+                        checked={selected.has(e.id)}
+                        title={canPick ? "Select this row" : "Select this row (it can be followed, but it is not sent: " + (reason || "not ready") + ")"}
                         onChange={() => onSelect(e.id)}
                       />
                       <button className="chev" onClick={() => onToggle(e.id)} title="Show / hide the line details">
@@ -207,6 +210,7 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
                     </div>
                   </td>
                   <td className="mono">{e.id}</td>
+                  {showOwner && <td className="small">{e.owner_email || <span className="muted">—</span>}</td>}
                   <td>{e.bank}</td>
                   <td className="mono strong">{e.bill_invoice_no}</td>
                   <td>{e.beneficiary || <span className="muted">—</span>}</td>
@@ -248,17 +252,21 @@ export default function EntriesTable({ entries, accounts, showLines, activeIds, 
                       <button
                         className="btn btn-primary"
                         disabled={!e.can_run || isActive}
-                        title={reason || "Fill this document in the ERP (nothing is saved)"}
+                        title={reason || (saveEnabled ? "Fill this document in the ERP and click Save when every value matches" : "Fill this document in the ERP (nothing is saved)")}
                         onClick={() => onRun([e.id])}
                       >
-                        {isActive ? "In progress…" : e.last_run && e.last_run.state !== "cancelled" ? "Run again" : "Proceed to ERP"}
+                        {isActive
+                          ? "In progress…"
+                          : e.last_run && e.last_run.state !== "cancelled"
+                          ? "Run again"
+                          : "Proceed to ERP"}
                       </button>
                     )}
                   </td>
                 </tr>
                 {open && (
                   <tr className="detail-row">
-                    <td colSpan={22 + accounts.length}><Lines e={e} /></td>
+                    <td colSpan={22 + accounts.length + (showOwner ? 1 : 0)}><Lines e={e} saveEnabled={saveEnabled} /></td>
                   </tr>
                 )}
               </Fragment>

@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import (JSON, Boolean, Date, DateTime, ForeignKey, Numeric, String,
+from sqlalchemy import (JSON, Boolean, Date, DateTime, ForeignKey, Numeric, String, Text,
                         UniqueConstraint, create_engine, select)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column, relationship,
@@ -58,6 +58,7 @@ class Realization(Base):
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
     source_file: Mapped[str | None] = mapped_column(String(300))
     message_id: Mapped[str | None] = mapped_column(String(998))
+    owner_email: Mapped[str | None] = mapped_column(String(320), index=True)   # who sent / uploaded it (None = old data)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
@@ -118,7 +119,17 @@ class OtherDocument(Base):
     status: Mapped[str] = mapped_column(String(20), default="unsupported")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     message_id: Mapped[str | None] = mapped_column(String(998))
+    owner_email: Mapped[str | None] = mapped_column(String(320), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ErpCredential(Base):
+    """A user's own ERP login. The password is stored encrypted (components/secret_box.py), never in clear text."""
+    __tablename__ = "erp_credentials"
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    username: Mapped[str] = mapped_column(String(200))
+    password_enc: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 _engine = create_engine(settings.database_url, pool_pre_ping=True)
@@ -127,6 +138,20 @@ _Session = sessionmaker(_engine, expire_on_commit=False)
 
 def init_db() -> None:
     Base.metadata.create_all(_engine)
+    _add_owner_columns()
+
+
+def _add_owner_columns() -> None:
+    """create_all does not alter existing tables: add owner_email to databases made before personalisation."""
+    from sqlalchemy import inspect, text
+    insp = inspect(_engine)
+    for table in ("export_realizations", "other_documents"):
+        if "owner_email" in {c["name"] for c in insp.get_columns(table)}:
+            continue
+        with _engine.begin() as c:
+            c.execute(text(f"ALTER TABLE {table} ADD COLUMN owner_email VARCHAR(320)"))
+            c.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_owner_email ON {table} (owner_email)"))
+        log.info("added owner_email to %s", table)
 
 
 @contextmanager
@@ -172,6 +197,7 @@ def _to_dict(r: Realization) -> dict:
         "status": r.status, "needs_review": r.needs_review, "issues": r.issues or [],
         "notes": r.notes or [], "meta": r.meta or {}, "source_file": r.source_file,
         "created_at": r.created_at.isoformat() if r.created_at else None,
+        "owner_email": r.owner_email,
         "distributions": [_dist_dict(d) for d in r.distributions],
     }
 
@@ -190,7 +216,8 @@ def log_email(message_id: str, sender: str, subject: str, status: str) -> None:
 
 
 # ---------------------------------------------------------------- save
-def save_realization(rec: dict, message_id: str | None = None, replace: bool = False) -> tuple[str, int]:
+def save_realization(rec: dict, message_id: str | None = None, replace: bool = False,
+                     owner_email: str | None = None) -> tuple[str, int]:
     """Returns ('saved'|'duplicate', id). One transaction: all rows commit together or not at all."""
     try:
         with get_session() as s:
@@ -212,7 +239,7 @@ def save_realization(rec: dict, message_id: str | None = None, replace: bool = F
                 total_domestic=_q2(rec["total_domestic"]) if rec["total_domestic"] is not None else None,
                 needs_review=rec["needs_review"],
                 issues=rec["issues"], notes=rec["notes"], meta=rec["meta"],
-                source_file=rec.get("source_file"), message_id=message_id,
+                source_file=rec.get("source_file"), message_id=message_id, owner_email=owner_email,
                 deductions=[Deduction(
                     label=d.get("label"), account_head=d.get("account_head"),
                     document_currency=_q2(d["document_currency"]),
@@ -239,11 +266,11 @@ def save_realization(rec: dict, message_id: str | None = None, replace: bool = F
         raise CustomException("Could not save realization", e)
 
 
-def save_other_document(rec: dict, message_id: str | None = None) -> int:
+def save_other_document(rec: dict, message_id: str | None = None, owner_email: str | None = None) -> int:
     with get_session() as s:
         doc = OtherDocument(
             source_file=rec.get("source_file"), bank=rec.get("bank"), doc_type=rec.get("doc_type"),
-            extractor=rec.get("extractor"), message_id=message_id,
+            extractor=rec.get("extractor"), message_id=message_id, owner_email=owner_email,
             status="needs_review" if rec.get("extractor") == "llm_fallback" else "unsupported",
             payload={k: v for k, v in rec.items() if k not in ("source_file",)})
         s.add(doc)
@@ -252,9 +279,13 @@ def save_other_document(rec: dict, message_id: str | None = None) -> int:
 
 
 # ---------------------------------------------------------------- read
-def list_realizations(status: str | None = None, needs_review: bool | None = None, limit: int = 200) -> list[dict]:
+def list_realizations(status: str | None = None, needs_review: bool | None = None, limit: int = 200,
+                      owner_email: str | None = None) -> list[dict]:
+    """owner_email=None -> everything (master / sign-in off); otherwise only that user's own entries."""
     with get_session() as s:
         q = select(Realization).order_by(Realization.id.desc()).limit(limit)
+        if owner_email is not None:
+            q = q.where(Realization.owner_email == owner_email)
         if status:
             q = q.where(Realization.status == status)
         if needs_review is not None:
@@ -274,10 +305,13 @@ def get_realization(rid: int) -> dict | None:
         return _to_dict(r) if r else None
 
 
-def list_other_documents(limit: int = 200) -> list[dict]:
+def list_other_documents(limit: int = 200, owner_email: str | None = None) -> list[dict]:
     with get_session() as s:
-        rows = s.scalars(select(OtherDocument).order_by(OtherDocument.id.desc()).limit(limit))
-        return [{"id": d.id, "source_file": d.source_file, "bank": d.bank, "doc_type": d.doc_type,
+        q = select(OtherDocument).order_by(OtherDocument.id.desc()).limit(limit)
+        if owner_email is not None:
+            q = q.where(OtherDocument.owner_email == owner_email)
+        rows = s.scalars(q)
+        return [{"id": d.id, "owner_email": d.owner_email, "source_file": d.source_file, "bank": d.bank, "doc_type": d.doc_type,
                  "extractor": d.extractor, "status": d.status, "payload": d.payload,
                  "created_at": d.created_at.isoformat()} for d in rows]
 
@@ -380,6 +414,53 @@ def mark_filled(rid: int, note: str | None = None) -> dict | None:
         return _to_dict(r)
 
 
+def _save_log(meta: dict, state: str | None, note: str | None, by: str | None) -> list:
+    log = list(meta.get("erp_save_log") or [])[-19:]
+    log.append({"at": _now().isoformat(), "state": state or "cleared", "by": by, "note": note})
+    return log
+
+
+def set_erp_save_state(rid: int, state: str | None, note: str | None = None, by: str | None = None) -> dict | None:
+    """What happened at the ERP's Save button for this entry (kept in meta, so no migration is needed).
+        in_progress  Save is about to be / has just been clicked
+        unconfirmed  Save was clicked but the ERP did not clearly answer: a person must look in the ERP
+        None         cleared: the ERP refused, or a person confirmed it was NOT saved
+    While a state is set the entry cannot be run again, which is what prevents a double save."""
+    with get_session() as s:
+        r = s.get(Realization, rid)
+        if r is None:
+            return None
+        meta = dict(r.meta or {})
+        if state:
+            meta["erp_save_state"], meta["erp_save_at"] = state, _now().isoformat()
+        else:
+            meta.pop("erp_save_state", None)
+            meta.pop("erp_save_at", None)
+        meta["erp_save_log"] = _save_log(meta, state, note, by)
+        r.meta = meta
+        s.commit()
+        return _to_dict(r)
+
+
+def mark_saved_in_erp(rid: int, note: str | None = None, by: str | None = None) -> dict | None:
+    """The entry IS saved in the ERP (the robot read the ERP's answer, or a person confirmed it). Final: status filled.
+    Never refuses: the ERP already holds the entry, so the database must say so whatever else is true."""
+    with get_session() as s:
+        r = s.get(Realization, rid)
+        if r is None:
+            return None
+        meta = dict(r.meta or {})
+        meta.pop("erp_save_state", None)
+        meta.pop("erp_save_at", None)
+        meta["erp_save_log"] = _save_log(meta, "saved", note, by)
+        meta["erp_fill"] = {"at": _now().isoformat(), "note": note, "by": by}
+        r.meta = meta
+        r.status = "filled"
+        r.updated_at = _now()
+        s.commit()
+        return _to_dict(r)
+
+
 def record_erp_click(rid: int, user: str | None) -> None:
     """Someone pressed Proceed to ERP / Run again for this entry: remember when and who (last click + a short log).
     Kept inside meta (JSON), so existing databases need no migration."""
@@ -414,3 +495,31 @@ def erp_payload(d: dict) -> dict:
                         "Cumulative Bill Balance": d["cumulative_bill_balance"],
                         "Domestic Currency": d["grand_total_domestic"]},
     }
+
+
+# ---------------------------------------------------------------- personal ERP logins
+def save_erp_credential(email: str, username: str, password_enc: str) -> None:
+    with get_session() as s:
+        row = s.get(ErpCredential, email.lower())
+        if row is None:
+            s.add(ErpCredential(email=email.lower(), username=username, password_enc=password_enc))
+        else:
+            row.username, row.password_enc, row.updated_at = username, password_enc, _now()
+        s.commit()
+
+
+def get_erp_credential(email: str) -> tuple[str, str] | None:
+    """(username, encrypted password) or None."""
+    with get_session() as s:
+        row = s.get(ErpCredential, email.lower())
+        return (row.username, row.password_enc) if row else None
+
+
+def delete_erp_credential(email: str) -> bool:
+    with get_session() as s:
+        row = s.get(ErpCredential, email.lower())
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True
