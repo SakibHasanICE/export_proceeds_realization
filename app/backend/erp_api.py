@@ -47,6 +47,15 @@ class RunRequest(BaseModel):
 PAGE_SIZE = 100          # entries per page
 
 
+class HideBody(BaseModel):
+    entry_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+def _can_see(entry_id: int, user: Optional[str]) -> bool:
+    rec = database.get_realization(entry_id)
+    return rec is not None and can_access(rec.get("owner_email"), user)
+
+
 class CellEdit(BaseModel):
     field: str = Field(min_length=1, max_length=60)
     value: Optional[str] = Field(default=None, max_length=300)
@@ -78,12 +87,14 @@ def build_router(require_key, current_user) -> APIRouter:
 
     @router.get("/entries")
     def entries(page: int = 1, status: Optional[str] = None, search: str = "", owner: str = "all",
-                only_ready: bool = False, user: Optional[str] = Depends(current_user)):
+                only_ready: bool = False, hidden: bool = False, user: Optional[str] = Depends(current_user)):
         """One page (100) of this user's entries, newest first. Search / status / owner filters work on ALL pages.
 """
         mgr = get_manager()
         latest = mgr.latest_by_entry()
-        args = dict(owner_email=owner_scope(user), status=status, search=search, owner_filter=owner)
+        hid = database.hidden_ids(user or "")
+        args = dict(owner_email=owner_scope(user), ids_in=hid if hidden else None,
+                    ids_not_in=None if hidden else hid, status=status, search=search, owner_filter=owner)
         page = max(1, page)
 
         def view(rec):
@@ -107,11 +118,21 @@ def build_router(require_key, current_user) -> APIRouter:
         master = is_master(user)
         owners = database.distinct_owners() if master else []
         return {"entries": out, "worker": mgr.worker_status(), "save_enabled": save_enabled(),
-                "viewer": {"email": user, "is_master": master}, "owners": owners,
+                "viewer": {"email": user, "is_master": master}, "owners": owners, "hidden_count": len(hid),
                 "page": page, "pages": pages, "total": total, "page_size": PAGE_SIZE,
                 "erp_login": credentials.mode_for(user),
                 "erp_configured": bool(os.getenv("ERP_USERNAME") and os.getenv("ERP_PASSWORD"))
                                   or credentials.mode_for(user)["mode"] != "missing"}
+
+    @router.post("/entries/hide")
+    def hide_entries(body: HideBody, user: Optional[str] = Depends(current_user)):
+        """Hide entries from this user's own list (nothing is deleted; 'show hidden' brings them back)."""
+        ids = [i for i in body.entry_ids if _can_see(i, user)]
+        return {"hidden": database.hide_entries(user or "", ids)}
+
+    @router.post("/entries/unhide")
+    def unhide_entries(body: HideBody, user: Optional[str] = Depends(current_user)):
+        return {"unhidden": database.unhide_entries(user or "", list(body.entry_ids))}
 
     @router.put("/entries/{entry_id}/cell")
     def edit_cell(entry_id: int, body: CellEdit, user: Optional[str] = Depends(current_user)):

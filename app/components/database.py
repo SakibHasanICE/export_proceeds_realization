@@ -132,6 +132,14 @@ class ErpCredential(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class HiddenEntry(Base):
+    """An entry a user hid from their own list (their view only: nothing is deleted, others still see it)."""
+    __tablename__ = "hidden_entries"
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    entry_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    hidden_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 _engine = create_engine(settings.database_url, pool_pre_ping=True)
 _Session = sessionmaker(_engine, expire_on_commit=False)
 
@@ -526,7 +534,7 @@ def delete_erp_credential(email: str) -> bool:
 
 
 # ---------------------------------------------------------------- paginated list (the web page: 100 per page)
-def _entry_filters(owner_email, status, search, owner_filter):
+def _entry_filters(owner_email, ids_in, ids_not_in, status, search, owner_filter):
     from sqlalchemy import cast, or_
     conds = []
     if owner_email is not None:                     # a normal user: only their own
@@ -535,6 +543,10 @@ def _entry_filters(owner_email, status, search, owner_filter):
         conds.append(Realization.owner_email.is_(None))
     elif owner_filter and owner_filter != "all":    # master picked one user
         conds.append(Realization.owner_email == owner_filter.lower())
+    if ids_in is not None:
+        conds.append(Realization.id.in_(list(ids_in)))
+    if ids_not_in:
+        conds.append(Realization.id.notin_(list(ids_not_in)))
     if status and status != "all":
         conds.append(Realization.status == status)
     q = (search or "").strip()
@@ -546,11 +558,12 @@ def _entry_filters(owner_email, status, search, owner_filter):
     return conds
 
 
-def query_realizations(owner_email: str | None = None, status: str | None = None, search: str | None = None,
+def query_realizations(owner_email: str | None = None, ids_in: set[int] | None = None,
+                       ids_not_in: set[int] | None = None, status: str | None = None, search: str | None = None,
                        owner_filter: str | None = None, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
     """(rows newest first, total matching). limit=None returns every match (used when the 'ready' filter needs them all)."""
     from sqlalchemy import func
-    conds = _entry_filters(owner_email, status, search, owner_filter)
+    conds = _entry_filters(owner_email, ids_in, ids_not_in, status, search, owner_filter)
     with get_session() as s:
         total = s.scalar(select(func.count()).select_from(Realization).where(*conds)) or 0
         q = select(Realization).where(*conds).order_by(Realization.id.desc()).offset(offset)
@@ -670,3 +683,28 @@ def edit_entry(rid: int, field: str, value, user: str | None = None) -> dict | N
             raise ValueError("Another entry of this bank already has this Bill/Invoice No.")
         log.info("entry %s: %s edited by %s (%r -> %r)", rid, field, user, before, after)
         return _to_dict(r)
+
+
+# ---------------------------------------------------------------- hide / show entries (per user)
+def hidden_ids(email: str) -> set[int]:
+    with get_session() as s:
+        return set(s.scalars(select(HiddenEntry.entry_id).where(HiddenEntry.email == email.lower())))
+
+
+def hide_entries(email: str, ids: list[int]) -> int:
+    email = email.lower()
+    with get_session() as s:
+        have = set(s.scalars(select(HiddenEntry.entry_id).where(HiddenEntry.email == email)))
+        new = [i for i in dict.fromkeys(ids) if i not in have]
+        for i in new:
+            s.add(HiddenEntry(email=email, entry_id=i))
+        s.commit()
+        return len(new)
+
+
+def unhide_entries(email: str, ids: list[int]) -> int:
+    from sqlalchemy import delete
+    with get_session() as s:
+        r = s.execute(delete(HiddenEntry).where(HiddenEntry.email == email.lower(), HiddenEntry.entry_id.in_(list(ids))))
+        s.commit()
+        return r.rowcount or 0

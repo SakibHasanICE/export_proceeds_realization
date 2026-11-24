@@ -351,9 +351,15 @@ def build_erp_record(bank: str, raw: dict) -> dict:
         ac_no = acct.get("ac_no") or x.get("ac_no")   # full numbers printed by the bank are used as is
         if not ac_no and x.get("ac_suffix") and settings.hsbc_account_prefix:
             ac_no = settings.hsbc_account_prefix + str(x["ac_suffix"])   # HSBC: fixed prefix + printed last 6 digits
-        if not ac_no or not acct.get("account_head"):
+        head = acct.get("account_head")
+        if not head and x.get("head_hint") and ac_no:
+            # a parser knew the kind of account (e.g. the sheet column it came from): use that kind's head
+            head = x["head_hint"]
+            notes.append(f"account {ac_no}: account head '{head}' taken from the column it was read from "
+                         "(this account is not in account_map.json)")
+        if not ac_no or not head:
             notes.append(f"account lookup incomplete for {key}")
-        dist_rows.append(_row(x["amount"], rate, account_head=acct.get("account_head"), ac_loan_no=ac_no))
+        dist_rows.append(_row(x["amount"], rate, account_head=head, ac_loan_no=ac_no))
 
     ded_rows = [_row(d["amount"], rate, label=d["label"], account_head=deduction_head_for(d["label"]))
                 for d in deductions]

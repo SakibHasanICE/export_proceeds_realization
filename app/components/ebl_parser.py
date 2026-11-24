@@ -21,7 +21,7 @@ from pathlib import Path
 
 import openpyxl
 
-from app.components.bank_parsers import build_erp_record
+from app.components.bank_parsers import ACCOUNT_MAP, build_erp_record
 
 BANK = "EBL"
 CENT = D("0.01")
@@ -34,6 +34,11 @@ DISTRIBUTIONS = [
     ("MARGIN ON OTHER IMPORT OBLIGATIONS", "MARGIN ON OTHER IMPORT OBLIGATIONS (15 DAYS)",
      "margin on other import obligations"),
 ]
+# the account head of a kind of account, used when its number is not in account_map.json (a new customer's accounts)
+KIND_HEAD = {
+    "margin": (ACCOUNT_MAP.get("220600009") or {}).get("account_head") or "BTB Margin/DFC/BLO/DAD/RAD/FBPAR A/C",
+    "ERQ": (ACCOUNT_MAP.get("1043100450368") or {}).get("account_head") or "ERQ Account",
+}
 BDT_CHARGES = {"commission": "COMMISSION ON EXPORT BILL", "courier": "COUR. CHG.", "export_charge": "EXP CHG.",
                "govt_tax": "GOVT. TAX", "central_fund": "CENTRAL FUND"}
 
@@ -148,6 +153,24 @@ def _parse_sheet(ws) -> list[dict]:
     amount_col = col_by_prefix("BILL AMT")
     proceeds_col = col_by_prefix("PROCEEDS")
 
+    # Account numbers sit in columns RIGHT of the amount columns (after LC/CONTRACT NO.). Their headers differ per
+    # customer ("UGL ERQ", "ERQ", "FAKHRUDDIN ERQ"; "UGL CD", "CD"), so they are recognised by what they contain.
+    headers = [(c, _norm(ws.cell(hdr, c).value)) for c in range(1, ws.max_column + 1) if ws.cell(hdr, c).value is not None]
+    split = cols.get("LC/CONTRACT NO.") or max((c for h, c in cols.items() if h in
+                                               {"MARGIN", "CM AMT.", "ERQ", "MARGIN ON OTHER IMPORT OBLIGATIONS"}), default=0)
+
+    def acct_col(test, *fallback_names):
+        found = next((c for c, h in headers if c > split and test(h)), None)
+        return found or next((cols[n] for n in fallback_names if n in cols), None)
+
+    col_margin = acct_col(lambda h: "MARGIN CORP" in h, "MARGIN CORP.")
+    col_cm = acct_col(lambda h: "CD" in h.split(), "UGL CD")
+    col_erq = acct_col(lambda h: "ERQ" in h, "UGL ERQ")
+
+    def acct_at(r, col):
+        a = _acct(ws.cell(r, col).value) if col else None
+        return a if a and re.fullmatch(r"\d{5,}", a) else None
+
     records, last_row = [], hdr
     for r in range(hdr + 1, ws.max_row + 1):
         if _norm(ws.cell(r, 1).value).startswith("TODAY'S"):
@@ -179,17 +202,17 @@ def _parse_sheet(ws) -> list[dict]:
 
         # EBL rule: "margin on other import obligations" is added to the margin account (one BTB row);
         # CM goes to its own account, ERQ to the ERQ account.
-        margin_acct = _acct(cell(r, "MARGIN CORP."))
+        margin_acct = acct_at(r, col_margin)
         merged = amounts["MARGIN"] + amounts["MARGIN ON OTHER IMPORT OBLIGATIONS"]
-        plan = [(merged, margin_acct, "margin + margin on other import obligations"),
-                (amounts["CM AMT."], _acct(cell(r, "UGL CD")), "CM amount"),
-                (amounts["ERQ"], _acct(cell(r, "UGL ERQ")), "ERQ")]
+        plan = [(merged, margin_acct, "margin + margin on other import obligations", "margin"),
+                (amounts["CM AMT."], acct_at(r, col_cm), "CM amount", None),
+                (amounts["ERQ"], acct_at(r, col_erq), "ERQ", "ERQ")]
         dists, parts = [], []
-        for raw_amt, acct, label in plan:
+        for raw_amt, acct, label, kind in plan:
             amt = _q(raw_amt)
             if amt == 0:
                 continue
-            dists.append({"amount": amt, "ac_no": acct})
+            dists.append({"amount": amt, "ac_no": acct, "head_hint": KIND_HEAD.get(kind) if acct else None})
             parts.append(f"{label} {amt:,.2f} -> {acct or 'no account on the sheet'}")
         notes.append("distribution rows, in order: " + "; ".join(parts))
 

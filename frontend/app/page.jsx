@@ -29,6 +29,8 @@ export default function Page() {
   const [search, setSearch] = useState("");
   const [dSearch, setDSearch] = useState("");           // the search text the server is asked for (after a short pause)
   const [page, setPage] = useState(1);                  // 100 entries per page
+  const [showHidden, setShowHidden] = useState(false);  // false: my normal list; true: only the entries I hid
+  const [hiddenCount, setHiddenCount] = useState(0);
   const [pageInfo, setPageInfo] = useState({ pages: 1, total: 0 });
   const [onlyReady, setOnlyReady] = useState(false);
   const [showLines, setShowLines] = useState(false);
@@ -50,6 +52,7 @@ export default function Page() {
   const load = useCallback(async () => {
     try {
       const qs = new URLSearchParams({ page: String(page) });
+      if (showHidden) qs.set("hidden", "true");
       if (status !== "all") qs.set("status", status);
       if (dSearch.trim()) qs.set("search", dSearch.trim());
       if (ownerFilter !== "all") qs.set("owner", ownerFilter);
@@ -63,6 +66,7 @@ export default function Page() {
       setSaveEnabled(!!d.save_enabled);
       setViewer(d.viewer || { email: null, is_master: false });
       setOwners(d.owners || []);
+      setHiddenCount(d.hidden_count || 0);
       setErpLogin(d.erp_login || { mode: "shared", username: null });
       setLoadError(null);
     } catch (e) {
@@ -70,7 +74,7 @@ export default function Page() {
     } finally {
       setLoading(false);
     }
-  }, [page, status, dSearch, ownerFilter, onlyReady]);
+  }, [showHidden, page, status, dSearch, ownerFilter, onlyReady]);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -226,6 +230,28 @@ export default function Page() {
     }
   }
 
+  async function hideSelected() {
+    const ids = visible.filter((e) => selected.has(e.id)).map((e) => e.id);
+    if (ids.length === 0) return;
+    try {
+      await post(showHidden ? "/erp/entries/unhide" : "/erp/entries/hide", { entry_ids: ids });
+      flash(showHidden
+        ? `${ids.length} entr${ids.length > 1 ? "ies are" : "y is"} back in your list.`
+        : `Hid ${ids.length} entr${ids.length > 1 ? "ies" : "y"}. Tick "show hidden" to bring them back.`, 7000);
+      setSelected(new Set());
+      load();
+    } catch (e) {
+      flash(`Could not ${showHidden ? "unhide" : "hide"}: ${e.message}`);
+    }
+  }
+
+  function toggleShowHidden(v) {
+    setShowHidden(v);
+    setPage(1);
+    setSelected(new Set());
+    setExpanded(new Set());
+  }
+
   function goPage(p) {
     setPage(Math.max(1, Math.min(pageInfo.pages, p)));
     setSelected(new Set());
@@ -295,6 +321,11 @@ export default function Page() {
             </select>
           )}
           <label className="check"><input type="checkbox" checked={onlyReady} onChange={(e) => { setOnlyReady(e.target.checked); setPage(1); setSelected(new Set()); }} /> only ready to run</label>
+          {(hiddenCount > 0 || showHidden) && (
+            <label className="check">
+              <input type="checkbox" checked={showHidden} onChange={(e) => toggleShowHidden(e.target.checked)} /> show hidden ({hiddenCount})
+            </label>
+          )}
           <label className="check"><input type="checkbox" checked={showLines} onChange={(e) => setShowLines(e.target.checked)} /> show line details</label>
           <span className="spacer" />
           {viewer.email && <ErpLoginButton login={erpLogin} onChange={load} onNotice={flash} />}
@@ -350,10 +381,16 @@ export default function Page() {
 
       <footer className="footbar">
         <div>
-          <b>{runnable.length}</b> of {visible.length} shown document(s) are ready to send.
-          <span className="muted">
-            {saveEnabled ? " The robot works one by one and saves only entries that match." : " The robot works one by one and never saves."}
-          </span>
+          {showHidden ? (
+            <span><b>Hidden entries</b>: {visible.length} shown. Tick rows and press Unhide to bring them back.</span>
+          ) : (
+            <>
+              <b>{runnable.length}</b> of {visible.length} shown document(s) are ready to send.
+              <span className="muted">
+                {saveEnabled ? " The robot works one by one and saves only entries that match." : " The robot works one by one and never saves."}
+              </span>
+            </>
+          )}
         </div>
         <div className="footbtns">
           {selectedShown > 0 && (
@@ -364,18 +401,26 @@ export default function Page() {
               <button className="link" onClick={() => setSelected(new Set())}>Clear selection</button>
             </>
           )}
-          {picked.length > 0 && (
+          {selectedShown > 0 && (
+            <button className="btn btn-big" onClick={hideSelected}
+                    title={showHidden ? "Put the selected entries back in your list" : "Hide the selected entries from your list (nothing is deleted)"}>
+              {showHidden ? "Unhide" : "Hide"} selected ({selectedShown})
+            </button>
+          )}
+          {!showHidden && picked.length > 0 && (
             <button className="btn btn-primary btn-big" onClick={runSelected}>
               Selected Proceed to ERP ({picked.length})
             </button>
           )}
-          <button
-            className={"btn btn-big " + (picked.length > 0 ? "" : "btn-primary")}
-            disabled={runnable.length === 0}
-            onClick={runAll}
-          >
-            All Proceed to ERP ({runnable.length})
-          </button>
+          {!showHidden && (
+            <button
+              className={"btn btn-big " + (picked.length > 0 ? "" : "btn-primary")}
+              disabled={runnable.length === 0}
+              onClick={runAll}
+            >
+              All Proceed to ERP ({runnable.length})
+            </button>
+          )}
         </div>
       </footer>
     </main>
